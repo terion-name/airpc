@@ -14,6 +14,7 @@ import (
 	"github.com/terion-name/airpc/internal/httpheaders"
 	"github.com/terion-name/airpc/internal/natscore"
 	"github.com/terion-name/airpc/internal/protocol/httpunary"
+	"github.com/terion-name/airpc/internal/protocol/tunnel"
 )
 
 const defaultResponseLimit = 16 << 20
@@ -21,6 +22,7 @@ const defaultResponseLimit = 16 << 20
 type Connector struct {
 	nats          *natscore.Client
 	subscriptions []*natscore.Subscription
+	dataTunnel    *connectorTunnel
 	done          chan error
 }
 
@@ -34,12 +36,22 @@ func Start(ctx context.Context, cfg config.Config, id string) (*Connector, error
 	if err != nil {
 		return nil, err
 	}
+	streamByName, err := streamRoutes(cfg.Routes)
+	if err != nil {
+		return nil, err
+	}
 	nc, err := natscore.Connect(cfg.NATS.URL, "airpc-connector-"+id)
 	if err != nil {
 		return nil, err
 	}
 
 	connector := &Connector{nats: nc, done: make(chan error, 1)}
+	cleanup := func() {
+		for _, sub := range connector.subscriptions {
+			_ = sub.Unsubscribe()
+		}
+		nc.Close()
+	}
 	byName := make(map[string]route, len(routes))
 	for _, r := range routes {
 		byName[r.cfg.Name] = r
@@ -57,19 +69,37 @@ func Start(ctx context.Context, cfg config.Config, id string) (*Connector, error
 			_ = msg.Respond(payload)
 		})
 		if err != nil {
-			for _, sub := range connector.subscriptions {
-				_ = sub.Unsubscribe()
-			}
-			nc.Close()
+			cleanup()
 			return nil, err
 		}
 		connector.subscriptions = append(connector.subscriptions, sub)
 	}
+	for _, r := range streamByName {
+		routeCfg := r.cfg
+		sub, err := nc.QueueSubscribe(routeCfg.OpenSubject(), routeCfg.QueueGroup(), func(msg natscore.Msg) {
+			payload := handleOpenMessage(id, streamByName, msg.Data)
+			_ = msg.Respond(payload)
+		})
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		connector.subscriptions = append(connector.subscriptions, sub)
+	}
+	dataTunnel, err := dialConnectorTunnel(ctx, cfg, id, streamByName)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	connector.dataTunnel = dataTunnel
 
 	go func() {
 		<-ctx.Done()
 		for _, sub := range connector.subscriptions {
 			_ = sub.Unsubscribe()
+		}
+		if connector.dataTunnel != nil {
+			_ = connector.dataTunnel.conn.Close()
 		}
 		_ = nc.Drain()
 		connector.done <- nil
@@ -84,7 +114,7 @@ func Run(ctx context.Context, cfg config.Config, id string, started io.Writer) e
 		return err
 	}
 	if started != nil {
-		fmt.Fprintf(started, "connector %s subscribed to %d HTTP routes\n", id, len(connector.subscriptions))
+		fmt.Fprintf(started, "connector %s subscribed to %d routes (data tunnel: %t)\n", id, len(connector.subscriptions), connector.dataTunnel != nil)
 	}
 	return connector.Wait()
 }
@@ -94,6 +124,21 @@ func (c *Connector) Wait() error {
 		return nil
 	}
 	return <-c.done
+}
+
+func handleOpenMessage(connectorID string, routes map[string]streamRoute, data []byte) []byte {
+	req, err := tunnel.DecodeOpenRequest(data)
+	if err != nil {
+		payload, _ := tunnel.EncodeOpenResponse(tunnel.OpenResponse{Version: tunnel.Version, RequestID: "unknown", Accepted: false, Error: "invalid open request"})
+		return payload
+	}
+	r, ok := routes[req.Route]
+	if !ok || r.cfg.Mode != req.Kind {
+		payload, _ := tunnel.EncodeOpenResponse(tunnel.OpenResponse{Version: tunnel.Version, RequestID: req.RequestID, Accepted: false, Error: "route is not configured on connector"})
+		return payload
+	}
+	payload, _ := tunnel.EncodeOpenResponse(tunnel.OpenResponse{Version: tunnel.Version, RequestID: req.RequestID, Accepted: true, ConnectorID: connectorID})
+	return payload
 }
 
 func httpRoutes(routes []config.Route) ([]route, error) {

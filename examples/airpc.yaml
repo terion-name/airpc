@@ -19,17 +19,22 @@ routes:
     timeout: 30s
     forwarded_headers: [accept, content-type, x-request-id]
 
+  # TCP and gRPC routes listen on the edge and relay opaque bytes over
+  # the connector-owned data tunnel to private host:port targets.
   - name: echo-tcp
     mode: tcp
     listen: 127.0.0.1:7000
     target: 127.0.0.1:9001
 
+  # WebSocket routes upgrade on edge.http_addr and relay messages to
+  # private ws:// or wss:// targets.
   - name: chat-ws
     mode: websocket
     public_path: /chat
     target: ws://127.0.0.1:9002
     forwarded_headers: [sec-websocket-protocol, x-request-id]
 
+  # gRPC mode is currently an opaque HTTP/2/TCP preservation mode.
   - name: grpc-demo
     mode: grpc
     listen: 127.0.0.1:7001

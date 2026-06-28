@@ -26,7 +26,10 @@ const (
 
 type Server struct {
 	httpServer *http.Server
+	dataServer *http.Server
 	listener   net.Listener
+	dataListen net.Listener
+	tcpListen  []net.Listener
 	nats       *natscore.Client
 	done       chan error
 }
@@ -48,31 +51,82 @@ func Start(ctx context.Context, cfg config.Config) (*Server, error) {
 		nc.Close()
 		return nil, fmt.Errorf("listen edge HTTP %s: %w", cfg.Edge.HTTPAddr, err)
 	}
+	dataListener, err := net.Listen("tcp", cfg.Edge.DataAddr)
+	if err != nil {
+		_ = listener.Close()
+		nc.Close()
+		return nil, fmt.Errorf("listen edge data %s: %w", cfg.Edge.DataAddr, err)
+	}
 
-	routes := httpRoutes(cfg.Routes)
+	registry := newTunnelRegistry()
+	h := handler{nats: nc, httpRoutes: httpRoutes(cfg.Routes), wsRoutes: wsRoutes(cfg.Routes), registry: registry}
 	server := &Server{
-		httpServer: &http.Server{Handler: handler{nats: nc, routes: routes}},
+		httpServer: &http.Server{Handler: h},
+		dataServer: &http.Server{Handler: dataHandler{registry: registry, token: cfg.Connector.TunnelToken}},
 		listener:   listener,
+		dataListen: dataListener,
 		nats:       nc,
 		done:       make(chan error, 1),
 	}
 
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.httpServer.Shutdown(shutdownCtx)
-	}()
-	go func() {
-		err := server.httpServer.Serve(listener)
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
+	for _, r := range tcpRoutes(cfg.Routes) {
+		tcpListener, err := net.Listen("tcp", r.Listen)
+		if err != nil {
+			_ = listener.Close()
+			_ = dataListener.Close()
+			closeListeners(server.tcpListen)
+			nc.Close()
+			return nil, fmt.Errorf("listen route %s on %s: %w", r.Name, r.Listen, err)
 		}
+		server.tcpListen = append(server.tcpListen, tcpListener)
+	}
+
+	errCh := make(chan error, len(server.tcpListen)+2)
+	go serveHTTP(errCh, server.httpServer, listener)
+	go serveHTTP(errCh, server.dataServer, dataListener)
+	for i, r := range tcpRoutes(cfg.Routes) {
+		routeCfg := r
+		listener := server.tcpListen[i]
+		go func() {
+			errCh <- serveTCPRoute(ctx, nc, registry, routeCfg, listener)
+		}()
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case err := <-errCh:
+			if err != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				closeHTTPServer(shutdownCtx, server.httpServer)
+				closeHTTPServer(shutdownCtx, server.dataServer)
+				cancel()
+				closeListeners(server.tcpListen)
+				_ = nc.Drain()
+				server.done <- err
+				close(server.done)
+				return
+			}
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeHTTPServer(shutdownCtx, server.httpServer)
+		closeHTTPServer(shutdownCtx, server.dataServer)
+		cancel()
+		closeListeners(server.tcpListen)
 		_ = nc.Drain()
-		server.done <- err
+		server.done <- nil
 		close(server.done)
 	}()
 	return server, nil
+}
+
+func serveHTTP(errCh chan<- error, server *http.Server, listener net.Listener) {
+	err := server.Serve(listener)
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		err = nil
+	}
+	errCh <- err
 }
 
 func Run(ctx context.Context, cfg config.Config, started io.Writer) error {
@@ -81,7 +135,7 @@ func Run(ctx context.Context, cfg config.Config, started io.Writer) error {
 		return err
 	}
 	if started != nil {
-		fmt.Fprintf(started, "edge listening on http://%s with %d HTTP routes\n", server.Addr(), len(httpRoutes(cfg.Routes)))
+		fmt.Fprintf(started, "edge listening on http://%s (data ws://%s%s) with %d HTTP routes, %d WebSocket routes, and %d TCP/gRPC routes\n", server.Addr(), server.DataAddr(), dataTunnelPath, len(httpRoutes(cfg.Routes)), len(wsRoutes(cfg.Routes)), len(tcpRoutes(cfg.Routes)))
 	}
 	return server.Wait()
 }
@@ -93,6 +147,24 @@ func (s *Server) Addr() string {
 	return s.listener.Addr().String()
 }
 
+func (s *Server) DataAddr() string {
+	if s == nil || s.dataListen == nil {
+		return ""
+	}
+	return s.dataListen.Addr().String()
+}
+
+func (s *Server) TCPAddrs() []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.tcpListen))
+	for _, listener := range s.tcpListen {
+		out = append(out, listener.Addr().String())
+	}
+	return out
+}
+
 func (s *Server) Wait() error {
 	if s == nil || s.done == nil {
 		return nil
@@ -101,19 +173,29 @@ func (s *Server) Wait() error {
 }
 
 func (s *Server) Close(ctx context.Context) error {
-	if s == nil || s.httpServer == nil {
+	if s == nil {
 		return nil
 	}
-	return s.httpServer.Shutdown(ctx)
+	closeListeners(s.tcpListen)
+	closeHTTPServer(ctx, s.dataServer)
+	closeHTTPServer(ctx, s.httpServer)
+	return nil
 }
 
 type handler struct {
-	nats   *natscore.Client
-	routes []route
+	nats       *natscore.Client
+	httpRoutes []route
+	wsRoutes   []route
+	registry   *tunnelRegistry
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	matched, suffix, ok := matchRoute(h.routes, req)
+	if matched, suffix, ok := matchRoute(h.wsRoutes, req); ok {
+		handleWebSocketRoute(req.Context(), h.nats, h.registry, matched, suffix, w, req)
+		return
+	}
+
+	matched, suffix, ok := matchRoute(h.httpRoutes, req)
 	if !ok {
 		http.NotFound(w, req)
 		return
@@ -180,10 +262,14 @@ func httpRoutes(routes []config.Route) []route {
 		}
 		out = append(out, route{cfg: r, prefix: r.PublicPrefix, exact: r.PublicPath})
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return len(out[i].prefix)+len(out[i].exact) > len(out[j].prefix)+len(out[j].exact)
+	return sortRoutes(out)
+}
+
+func sortRoutes(routes []route) []route {
+	sort.SliceStable(routes, func(i, j int) bool {
+		return len(routes[i].prefix)+len(routes[i].exact) > len(routes[j].prefix)+len(routes[j].exact)
 	})
-	return out
+	return routes
 }
 
 func matchRoute(routes []route, req *http.Request) (route, string, bool) {

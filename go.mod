@@ -3,6 +3,7 @@ module github.com/terion-name/airpc
 go 1.22
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/nats-io/nats-server/v2 v2.10.14
 	github.com/nats-io/nats.go v1.35.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1

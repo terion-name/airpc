@@ -1,16 +1,16 @@
 # airpc
 
-airpc is an outbound-only edge/connector gateway. In this slice it supports HTTP unary proxying over NATS Core request/reply:
+airpc is an outbound-only edge/connector gateway. In this slice it supports:
 
-- an **edge** process listens for public HTTP requests;
-- a private **connector** process dials NATS and queue-subscribes for configured routes;
-- each HTTP request is encoded as a versioned MessagePack envelope and sent to `airpc.v1.route.<route>.unary`;
-- connector instances share the queue group `airpc.route.<route>.connectors`; and
-- the connector forwards the request to the private HTTP target and returns a MessagePack response envelope.
+- **HTTP unary** proxying over NATS Core request/reply;
+- **TCP** and **gRPC** opaque byte streams over a connector-initiated WebSocket data tunnel; and
+- **WebSocket** message relay over the same data tunnel.
 
-TCP, WebSocket, gRPC tunneling, PKI/mTLS, Kubernetes manifests, and SDKs are not implemented in this slice.
+An **edge** process listens on public HTTP/TCP addresses. A private **connector** process dials NATS, queue-subscribes for configured routes, and opens the outbound data WebSocket to the edge. HTTP requests use MessagePack envelopes on `airpc.v1.route.<route>.unary`. Non-unary routes first use `airpc.v1.route.<route>.open` to select a connector, then relay frames on that connector's active tunnel.
 
-## Run HTTP unary locally
+PKI/mTLS, Kubernetes manifests, SDKs, transparent proxying, and protocol-aware gRPC parsing are not implemented in this slice.
+
+## Run locally
 
 Start NATS, then run one edge and one connector with the same config:
 
@@ -28,28 +28,38 @@ With the example config, requests to the edge under `/demo` are sent to the conn
 curl -i http://127.0.0.1:8080/demo/hello?name=airpc
 ```
 
+The same edge process also starts:
+
+- `edge.data_addr` for connector-owned WebSocket tunnels at `/_airpc/data`;
+- each `tcp` route's `listen` address and relays raw bytes to the connector target; and
+- each `grpc` route's `listen` address as an opaque HTTP/2/TCP stream.
+
+WebSocket routes are served on the edge HTTP listener using `public_path` or `public_prefix` and are relayed as WebSocket messages to private `ws://` or `wss://` targets.
+
+First-product `grpc` mode intentionally preserves the raw HTTP/2/TCP stream. It does not yet parse gRPC methods, metrics, statuses, or trailers.
+
 ## Configuration
 
-See [`examples/airpc.yaml`](examples/airpc.yaml). Important fields for HTTP unary are:
+See [`examples/airpc.yaml`](examples/airpc.yaml). Important fields are:
 
 - `nats.url`: NATS server URL used by both edge and connector.
-- `edge.http_addr`: HTTP listen address for the edge.
+- `edge.http_addr`: HTTP listen address for HTTP unary and public WebSocket routes.
+- `edge.data_addr`: WebSocket tunnel listen address for connector data sessions.
+- `connector.edge_data_url`: connector URL for `edge.data_addr`, normally `ws://<edge-data>/_airpc/data`.
+- `connector.tunnel_token` (optional): shared token required on the data tunnel.
 - `routes[].name`: route token used in NATS subjects.
-- `routes[].mode: http`: enables HTTP unary runtime for that route.
-- `routes[].public_host` (optional): host to match at the edge.
-- `routes[].public_prefix` or `routes[].public_path`: public path match.
-- `routes[].target`: private backend base URL for the connector.
-- `routes[].max_inline_request` / `routes[].max_inline_response`: bounded MessagePack body sizes.
-- `routes[].timeout`: request deadline.
-- `routes[].forwarded_headers`: allow-list for request headers sent to the connector/backend.
+- `routes[].mode: http`: HTTP unary route. Uses `public_prefix`/`public_path`, URL `target`, inline body limits, `timeout`, and `forwarded_headers`.
+- `routes[].mode: websocket`: public WebSocket route. Uses `public_prefix`/`public_path` and private `ws://`/`wss://` `target`.
+- `routes[].mode: tcp`: public TCP listener. Uses `listen` and private `host:port` `target`.
+- `routes[].mode: grpc`: public TCP listener for opaque gRPC-over-HTTP/2. Uses `listen` and private `host:port` `target`.
 
 Derived NATS names:
 
 - Unary subject: `airpc.v1.route.<route>.unary`
-- Open subject reserved for future streams: `airpc.v1.route.<route>.open`
+- Open subject for stream routes: `airpc.v1.route.<route>.open`
 - Queue group: `airpc.route.<route>.connectors`
 
-The edge strips hop-by-hop headers and only forwards request headers listed in `forwarded_headers`. Response hop-by-hop headers are stripped before writing back to the client. The runtime does not log request/response bodies or Authorization values.
+The edge strips hop-by-hop HTTP headers and only forwards HTTP request headers listed in `forwarded_headers`. Response hop-by-hop headers are stripped before writing back to the client. The runtime does not log request/response bodies or Authorization values.
 
 ## Development
 
