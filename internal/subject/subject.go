@@ -57,16 +57,20 @@ func ValidateRouteName(route string) error {
 	if route == "" {
 		return fmt.Errorf("route name is required")
 	}
-	if len(route) > 63 {
-		return fmt.Errorf("route name %q exceeds 63 bytes", route)
+	if len(route) > 127 {
+		return fmt.Errorf("route name %q exceeds 127 bytes", route)
 	}
-	for i, r := range route {
+	if strings.ContainsAny(route, "*>") || strings.HasPrefix(route, ".") || strings.HasSuffix(route, ".") || strings.Contains(route, "..") {
+		return fmt.Errorf("route name %q is not a safe NATS token path", route)
+	}
+	for _, r := range route {
 		switch {
 		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
 		case r >= '0' && r <= '9':
-		case r == '-' && i > 0 && i < len(route)-1:
+		case r == '-' || r == '_' || r == '.':
 		default:
-			return fmt.Errorf("route name %q must use lowercase letters, digits, and interior hyphens", route)
+			return fmt.Errorf("route name %q must use letters, digits, '.', '-' or '_'", route)
 		}
 	}
 	return nil

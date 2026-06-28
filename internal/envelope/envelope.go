@@ -18,6 +18,25 @@ import (
 const (
 	Version              = 1
 	DefaultMaxDecodeSize = 32 * 1024 * 1024
+	DefaultMaxFrameSize  = 128 * 1024
+	DefaultMaxPayload    = 64 * 1024
+
+	KindTCP       = "tcp"
+	KindWebSocket = "websocket"
+	KindGRPC      = "grpc"
+
+	FrameOpen    = "OPEN"
+	FrameOpenOK  = "OPEN_OK"
+	FrameOpenErr = "OPEN_ERR"
+	FrameData    = "DATA"
+	FrameClose   = "CLOSE"
+	FramePing    = "PING"
+	FramePong    = "PONG"
+
+	OpcodeNone   = 0
+	OpcodeText   = 1
+	OpcodeBinary = 2
+	OpcodeClose  = 8
 )
 
 var (
@@ -43,19 +62,39 @@ type UnaryResponse struct {
 }
 
 type OpenRequest struct {
-	RequestID string
-	SessionID string
-	Route     string
-	Headers   http.Header
+	RequestID      string
+	SessionID      string
+	Route          string
+	Kind           string
+	DeadlineUnixMS int64
+	Host           string
+	Path           string
+	RawQuery       string
+	Headers        http.Header
+	TraceParent    string
+	TraceState     string
 }
 
 type OpenResponse struct {
-	RequestID string
+	RequestID   string
+	SessionID   string
+	Route       string
+	ConnectorID string
+	Accepted    bool
+	Code        string
+	Message     string
+	Headers     http.Header
+}
+
+type TunnelFrame struct {
+	Type      string
 	SessionID string
-	Accepted  bool
-	Code      string
-	Message   string
-	Headers   http.Header
+	Kind      string
+	Flags     uint32
+	Opcode    uint8
+	Payload   []byte
+	Code      uint16
+	Reason    string
 }
 
 func MarshalUnaryRequest(req UnaryRequest) ([]byte, error) {
@@ -183,13 +222,21 @@ func MarshalOpenRequest(req OpenRequest) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	enc := msgpack.NewEncoder(&buf)
-	if err := enc.EncodeArrayLen(5); err != nil {
+	if err := enc.EncodeArrayLen(12); err != nil {
 		return nil, err
 	}
 	if err := enc.EncodeUint8(Version); err != nil {
 		return nil, err
 	}
-	for _, s := range []string{req.RequestID, req.SessionID, req.Route} {
+	for _, s := range []string{req.RequestID, req.SessionID, req.Route, req.Kind} {
+		if err := enc.EncodeString(s); err != nil {
+			return nil, err
+		}
+	}
+	if err := enc.EncodeInt64(req.DeadlineUnixMS); err != nil {
+		return nil, err
+	}
+	for _, s := range []string{req.Host, req.Path, req.RawQuery} {
 		if err := enc.EncodeString(s); err != nil {
 			return nil, err
 		}
@@ -197,12 +244,17 @@ func MarshalOpenRequest(req OpenRequest) ([]byte, error) {
 	if err := encodeHeader(enc, req.Headers); err != nil {
 		return nil, err
 	}
+	for _, s := range []string{req.TraceParent, req.TraceState} {
+		if err := enc.EncodeString(s); err != nil {
+			return nil, err
+		}
+	}
 	return buf.Bytes(), nil
 }
 
 func UnmarshalOpenRequest(data []byte, maxSize int) (OpenRequest, error) {
 	var req OpenRequest
-	if err := decode(data, maxSize, 5, func(dec *msgpack.Decoder) error {
+	if err := decode(data, maxSize, 12, func(dec *msgpack.Decoder) error {
 		if err := decodeVersion(dec); err != nil {
 			return err
 		}
@@ -216,7 +268,28 @@ func UnmarshalOpenRequest(data []byte, maxSize int) (OpenRequest, error) {
 		if req.Route, err = dec.DecodeString(); err != nil {
 			return err
 		}
+		if req.Kind, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if req.DeadlineUnixMS, err = dec.DecodeInt64(); err != nil {
+			return err
+		}
+		if req.Host, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if req.Path, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if req.RawQuery, err = dec.DecodeString(); err != nil {
+			return err
+		}
 		if req.Headers, err = decodeHeader(dec); err != nil {
+			return err
+		}
+		if req.TraceParent, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if req.TraceState, err = dec.DecodeString(); err != nil {
 			return err
 		}
 		return req.validate()
@@ -232,13 +305,13 @@ func MarshalOpenResponse(resp OpenResponse) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	enc := msgpack.NewEncoder(&buf)
-	if err := enc.EncodeArrayLen(7); err != nil {
+	if err := enc.EncodeArrayLen(9); err != nil {
 		return nil, err
 	}
 	if err := enc.EncodeUint8(Version); err != nil {
 		return nil, err
 	}
-	for _, s := range []string{resp.RequestID, resp.SessionID} {
+	for _, s := range []string{resp.RequestID, resp.SessionID, resp.Route, resp.ConnectorID} {
 		if err := enc.EncodeString(s); err != nil {
 			return nil, err
 		}
@@ -259,7 +332,7 @@ func MarshalOpenResponse(resp OpenResponse) ([]byte, error) {
 
 func UnmarshalOpenResponse(data []byte, maxSize int) (OpenResponse, error) {
 	var resp OpenResponse
-	if err := decode(data, maxSize, 7, func(dec *msgpack.Decoder) error {
+	if err := decode(data, maxSize, 9, func(dec *msgpack.Decoder) error {
 		if err := decodeVersion(dec); err != nil {
 			return err
 		}
@@ -268,6 +341,12 @@ func UnmarshalOpenResponse(data []byte, maxSize int) (OpenResponse, error) {
 			return err
 		}
 		if resp.SessionID, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if resp.Route, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if resp.ConnectorID, err = dec.DecodeString(); err != nil {
 			return err
 		}
 		if resp.Accepted, err = dec.DecodeBool(); err != nil {
@@ -287,6 +366,100 @@ func UnmarshalOpenResponse(data []byte, maxSize int) (OpenResponse, error) {
 		return OpenResponse{}, err
 	}
 	return resp, nil
+}
+
+func MarshalTunnelFrame(frame TunnelFrame) ([]byte, error) {
+	if err := frame.validate(DefaultMaxPayload); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	if err := enc.EncodeArrayLen(9); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeUint8(Version); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeString(frame.Type); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeString(frame.SessionID); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeString(frame.Kind); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeUint64(uint64(frame.Flags)); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeUint8(frame.Opcode); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeBytes(frame.Payload); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeUint16(frame.Code); err != nil {
+		return nil, err
+	}
+	if err := enc.EncodeString(frame.Reason); err != nil {
+		return nil, err
+	}
+	if buf.Len() > DefaultMaxFrameSize {
+		return nil, fmt.Errorf("%w: frame %d > %d", ErrTooLarge, buf.Len(), DefaultMaxFrameSize)
+	}
+	return buf.Bytes(), nil
+}
+
+func UnmarshalTunnelFrame(data []byte, maxFrameSize, maxPayload int) (TunnelFrame, error) {
+	var frame TunnelFrame
+	if maxFrameSize <= 0 {
+		maxFrameSize = DefaultMaxFrameSize
+	}
+	if maxPayload <= 0 {
+		maxPayload = DefaultMaxPayload
+	}
+	if err := decode(data, maxFrameSize, 9, func(dec *msgpack.Decoder) error {
+		if err := decodeVersion(dec); err != nil {
+			return err
+		}
+		var err error
+		if frame.Type, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if frame.SessionID, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		if frame.Kind, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		flags, err := dec.DecodeUint64()
+		if err != nil {
+			return err
+		}
+		if flags > uint64(^uint32(0)) {
+			return fmt.Errorf("%w: flags overflow", ErrInvalid)
+		}
+		frame.Flags = uint32(flags)
+		if frame.Opcode, err = dec.DecodeUint8(); err != nil {
+			return err
+		}
+		if frame.Payload, err = dec.DecodeBytes(); err != nil {
+			return err
+		}
+		if len(frame.Payload) > maxPayload {
+			return fmt.Errorf("%w: payload %d > %d", ErrTooLarge, len(frame.Payload), maxPayload)
+		}
+		if frame.Code, err = dec.DecodeUint16(); err != nil {
+			return err
+		}
+		if frame.Reason, err = dec.DecodeString(); err != nil {
+			return err
+		}
+		return frame.validate(maxPayload)
+	}); err != nil {
+		return TunnelFrame{}, err
+	}
+	return frame, nil
 }
 
 func decode(data []byte, maxSize, wantLen int, fill func(*msgpack.Decoder) error) error {
@@ -421,6 +594,20 @@ func (r OpenRequest) validate() error {
 	if err := subject.ValidateRouteName(r.Route); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
+	if err := validateKind(r.Kind); err != nil {
+		return err
+	}
+	if r.DeadlineUnixMS <= 0 {
+		return fmt.Errorf("%w: deadline must be positive Unix milliseconds", ErrInvalid)
+	}
+	if r.Path != "" && (!strings.HasPrefix(r.Path, "/") || hasControl(r.Path)) {
+		return fmt.Errorf("%w: path must start with / and contain no control characters", ErrInvalid)
+	}
+	for _, value := range []string{r.Host, r.RawQuery, r.TraceParent, r.TraceState} {
+		if hasControl(value) {
+			return fmt.Errorf("%w: open metadata contains control characters", ErrInvalid)
+		}
+	}
 	return validateHeaders(r.Headers)
 }
 
@@ -431,10 +618,46 @@ func (r OpenResponse) validate() error {
 	if err := ids.Validate("session id", r.SessionID); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
-	if !r.Accepted && r.Code == "" {
+	if err := subject.ValidateRouteName(r.Route); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if r.Accepted {
+		if err := ids.Validate("connector id", r.ConnectorID); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+	} else if r.Code == "" {
 		return fmt.Errorf("%w: rejected open response requires a code", ErrInvalid)
 	}
 	return validateHeaders(r.Headers)
+}
+
+func (f TunnelFrame) validate(maxPayload int) error {
+	if err := validateFrameType(f.Type); err != nil {
+		return err
+	}
+	if err := ids.Validate("session id", f.SessionID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	if f.Type == FrameOpen {
+		if err := validateKind(f.Kind); err != nil {
+			return err
+		}
+	} else if f.Kind != "" {
+		return fmt.Errorf("%w: kind must be empty for %s frames", ErrInvalid, f.Type)
+	}
+	if err := validateOpcode(f.Opcode); err != nil {
+		return err
+	}
+	if maxPayload <= 0 {
+		maxPayload = DefaultMaxPayload
+	}
+	if len(f.Payload) > maxPayload {
+		return fmt.Errorf("%w: payload %d > %d", ErrTooLarge, len(f.Payload), maxPayload)
+	}
+	if hasControl(f.Reason) {
+		return fmt.Errorf("%w: reason contains control characters", ErrInvalid)
+	}
+	return nil
 }
 
 func validateHeaders(h http.Header) error {
@@ -468,6 +691,33 @@ func validateMethod(method string) error {
 		}
 	}
 	return nil
+}
+
+func validateKind(kind string) error {
+	switch kind {
+	case KindTCP, KindWebSocket, KindGRPC:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid kind %q", ErrInvalid, kind)
+	}
+}
+
+func validateFrameType(frameType string) error {
+	switch frameType {
+	case FrameOpen, FrameOpenOK, FrameOpenErr, FrameData, FrameClose, FramePing, FramePong:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid frame type %q", ErrInvalid, frameType)
+	}
+}
+
+func validateOpcode(opcode uint8) error {
+	switch opcode {
+	case OpcodeNone, OpcodeText, OpcodeBinary, OpcodeClose:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid opcode %d", ErrInvalid, opcode)
+	}
 }
 
 func hasControl(s string) bool {
