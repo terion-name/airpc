@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,124 +12,67 @@ func TestLoadExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile(example): %v", err)
 	}
-	if cfg.NATS.URLs[0] != "nats://127.0.0.1:4222" {
-		t.Fatalf("nats urls = %#v", cfg.NATS.URLs)
+	if cfg.NATS.URL != "nats://127.0.0.1:4222" {
+		t.Fatalf("nats url = %q", cfg.NATS.URL)
 	}
-	if cfg.Connector.ID != "local-1" {
-		t.Fatalf("connector id = %q", cfg.Connector.ID)
+	if cfg.Edge.HTTPAddr != "127.0.0.1:8080" {
+		t.Fatalf("edge http addr = %q", cfg.Edge.HTTPAddr)
 	}
-	if cfg.Edge.HTTP.Listen != "127.0.0.1:8080" {
-		t.Fatalf("edge listen = %q", cfg.Edge.HTTP.Listen)
+	if cfg.Edge.DataAddr != "127.0.0.1:8081" {
+		t.Fatalf("edge data addr = %q", cfg.Edge.DataAddr)
 	}
-	if got := len(cfg.Edge.Routes); got != 4 {
-		t.Fatalf("edge routes = %d", got)
+	if cfg.Connector.EdgeDataURL != "ws://127.0.0.1:8081/_airpc/data" {
+		t.Fatalf("connector edge data url = %q", cfg.Connector.EdgeDataURL)
 	}
-	r, ok := cfg.ConnectorRoute("demo")
-	if !ok {
-		t.Fatalf("demo connector route missing")
+	if got := len(cfg.Routes); got != 4 {
+		t.Fatalf("routes = %d", got)
 	}
-	if got := r.RequestTimeout.Duration; got != 30*time.Second {
-		t.Fatalf("route timeout = %s", got)
+
+	route := cfg.Routes[0]
+	if route.Name != "demo" || route.Mode != ModeHTTP {
+		t.Fatalf("first route = %#v", route)
 	}
-	if got := r.MaxRequestBytes.Bytes; got != 4*1024*1024 {
-		t.Fatalf("route max request bytes = %d", got)
+	if route.MaxRequestBodyBytes != Bytes(4*1024*1024) {
+		t.Fatalf("max request body bytes = %d", route.MaxRequestBodyBytes)
 	}
-	if u, err := r.TargetURL(); err != nil || u.Scheme != "http" {
-		t.Fatalf("TargetURL() = %v, %v", u, err)
-	}
-	if !cfg.ConnectorHasRoute("echo-tcp") {
-		t.Fatalf("expected connector to have echo-tcp")
+	if route.Timeout.Duration != 30*time.Second {
+		t.Fatalf("timeout = %s", route.Timeout.Duration)
 	}
 }
 
-func TestValidateRejectsBadPlanConfig(t *testing.T) {
+func TestSubjectDerivation(t *testing.T) {
+	route := Route{Name: "demo"}
+	if got := route.UnarySubject(); got != "airpc.unary.demo" {
+		t.Fatalf("UnarySubject() = %q", got)
+	}
+	if got := route.OpenSubject(); got != "airpc.open.demo" {
+		t.Fatalf("OpenSubject() = %q", got)
+	}
+	if got := route.QueueGroup(); got != "airpc.route.demo" {
+		t.Fatalf("QueueGroup() = %q", got)
+	}
+}
+
+func TestValidateRejectsBadConfig(t *testing.T) {
 	tests := []struct {
 		name string
-		repl func(string) string
+		yaml string
 		want string
 	}{
-		{
-			name: "bad route token wildcard",
-			repl: func(s string) string { return strings.Replace(s, "name: demo", "name: bad*route", 1) },
-			want: "wildcards",
-		},
-		{
-			name: "bad connector id",
-			repl: func(s string) string { return strings.Replace(s, "id: local-1", "id: bad>id", 1) },
-			want: "connector.id",
-		},
-		{
-			name: "duplicate edge route name",
-			repl: func(s string) string { return strings.Replace(s, "name: echo-tcp", "name: demo", 1) },
-			want: "duplicated",
-		},
-		{
-			name: "duplicate connector route name",
-			repl: func(s string) string {
-				return strings.Replace(s, "name: echo-tcp\n      type: tcp\n      target", "name: demo\n      type: tcp\n      target", 1)
-			},
-			want: "duplicated",
-		},
-		{
-			name: "invalid route type",
-			repl: func(s string) string { return strings.Replace(s, "type: http", "type: smtp", 1) },
-			want: "not supported",
-		},
-		{
-			name: "bad http target scheme",
-			repl: func(s string) string {
-				return strings.Replace(s, "target: http://127.0.0.1:8081", "target: ftp://127.0.0.1:8081", 1)
-			},
-			want: "scheme",
-		},
-		{
-			name: "target rejects credentials",
-			repl: func(s string) string {
-				return strings.Replace(s, "target: http://127.0.0.1:8081", "target: http://user:pass@127.0.0.1:8081", 1)
-			},
-			want: "credentials",
-		},
-		{
-			name: "bad tcp target",
-			repl: func(s string) string {
-				return strings.Replace(s, "target: 127.0.0.1:7000", "target: http://127.0.0.1:7000", 1)
-			},
-			want: "host:port",
-		},
-		{
-			name: "bad edge listen",
-			repl: func(s string) string { return strings.Replace(s, "listen: 127.0.0.1:9000", "listen: 127.0.0.1", 1) },
-			want: "listen",
-		},
-		{
-			name: "bad tunnel URL scheme",
-			repl: func(s string) string {
-				return strings.Replace(s, "edge_tunnel_url: ws://127.0.0.1:8080/_airpc/v1/tunnel", "edge_tunnel_url: http://127.0.0.1:8080/_airpc/v1/tunnel", 1)
-			},
-			want: "scheme",
-		},
-		{
-			name: "route type mismatch",
-			repl: func(s string) string {
-				return strings.Replace(s, "name: demo\n      type: http\n      target: http://127.0.0.1:8081", "name: demo\n      type: tcp\n      target: 127.0.0.1:8081", 1)
-			},
-			want: "does not match",
-		},
-		{
-			name: "invalid duration",
-			repl: func(s string) string { return strings.Replace(s, "request_timeout: 30s", "request_timeout: 0s", 1) },
-			want: "must be positive",
-		},
-		{
-			name: "invalid size",
-			repl: func(s string) string { return strings.Replace(s, "max_request_bytes: 4MiB", "max_request_bytes: 0", 1) },
-			want: "must be positive",
-		},
+		{name: "missing nats url", yaml: strings.Replace(validConfig, "url: nats://127.0.0.1:4222", "url: ''", 1), want: "nats.url"},
+		{name: "bad edge address", yaml: strings.Replace(validConfig, "http_addr: 127.0.0.1:8080", "http_addr: 127.0.0.1", 1), want: "edge.http_addr"},
+		{name: "bad connector url", yaml: strings.Replace(validConfig, "ws://127.0.0.1:8081/_airpc/data", "http://127.0.0.1:8081/_airpc/data", 1), want: "connector.edge_data_url"},
+		{name: "bad route name", yaml: strings.Replace(validConfig, "name: demo", "name: bad.route", 1), want: "subject"},
+		{name: "duplicate route name", yaml: strings.Replace(validConfig, "name: grpc-demo", "name: demo", 1), want: "duplicated"},
+		{name: "bad mode", yaml: strings.Replace(validConfig, "mode: http", "mode: smtp", 1), want: "not supported"},
+		{name: "bad http target scheme", yaml: strings.Replace(validConfig, "target: http://127.0.0.1:9000", "target: ftp://127.0.0.1:9000", 1), want: "scheme"},
+		{name: "bad tcp target", yaml: strings.Replace(validConfig, "target: 127.0.0.1:9001", "target: http://127.0.0.1:9001", 1), want: "host:port"},
+		{name: "bad public path", yaml: strings.Replace(validConfig, "public_prefix: /demo", "public_prefix: demo", 1), want: "public_prefix"},
+		{name: "bad header", yaml: strings.Replace(validConfig, "forwarded_headers: [accept, content-type, x-request-id]", "forwarded_headers: ['bad header']", 1), want: "forwarded_headers"},
 	}
-	base := mustReadExample(t)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load([]byte(tc.repl(base)))
+			_, err := Load([]byte(tc.yaml))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Load() error = %v, want containing %q", err, tc.want)
 			}
@@ -138,45 +80,34 @@ func TestValidateRejectsBadPlanConfig(t *testing.T) {
 	}
 }
 
-func TestConnectorIDOverrideSemantics(t *testing.T) {
-	base := strings.Replace(mustReadExample(t), "id: local-1", "id: ''", 1)
-	path := filepath.Join(t.TempDir(), "airpc.yaml")
-	if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "connector.id") {
-		t.Fatalf("LoadFile without connector id error = %v", err)
-	}
-	cfg, err := LoadFileWithConnectorID(path, "override-1")
-	if err != nil {
-		t.Fatalf("LoadFileWithConnectorID: %v", err)
-	}
-	if cfg.Connector.ID != "override-1" {
-		t.Fatalf("connector id = %q", cfg.Connector.ID)
-	}
-	if _, err := LoadFileWithConnectorID(path, "bad id"); err == nil || !strings.Contains(err.Error(), "connector.id") {
-		t.Fatalf("bad override error = %v", err)
-	}
-}
-
-func TestParseSize(t *testing.T) {
-	tests := map[string]int64{"10": 10, "1KiB": 1024, "2MB": 2_000_000, "3mib": 3 * 1024 * 1024}
-	for raw, want := range tests {
-		got, err := ParseSize(raw)
-		if err != nil {
-			t.Fatalf("ParseSize(%q): %v", raw, err)
-		}
-		if got != want {
-			t.Fatalf("ParseSize(%q) = %d, want %d", raw, got, want)
-		}
-	}
-}
-
-func mustReadExample(t *testing.T) string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "airpc.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(data)
-}
+const validConfig = `
+nats:
+  url: nats://127.0.0.1:4222
+edge:
+  http_addr: 127.0.0.1:8080
+  data_addr: 127.0.0.1:8081
+connector:
+  edge_data_url: ws://127.0.0.1:8081/_airpc/data
+  tunnel_token: dev-token
+routes:
+  - name: demo
+    mode: http
+    public_prefix: /demo
+    target: http://127.0.0.1:9000
+    max_request_body_bytes: 4MiB
+    max_response_body_bytes: 16MiB
+    timeout: 30s
+    forwarded_headers: [accept, content-type, x-request-id]
+  - name: echo-tcp
+    mode: tcp
+    listen: 127.0.0.1:7000
+    target: 127.0.0.1:9001
+  - name: chat-ws
+    mode: websocket
+    public_path: /chat
+    target: ws://127.0.0.1:9002
+  - name: grpc-demo
+    mode: grpc
+    listen: 127.0.0.1:7001
+    target: 127.0.0.1:9003
+`

@@ -1,58 +1,36 @@
 nats:
-  urls:
-    - nats://127.0.0.1:4222
-  name: airpc-dev
-
-defaults:
-  request_timeout: 30s
-  max_request_bytes: 4MiB
-  max_response_bytes: 16MiB
+  url: nats://127.0.0.1:4222
 
 edge:
-  http:
-    listen: 127.0.0.1:8080
-    tunnel_path: /_airpc/v1/tunnel
-  routes:
-    - name: demo
-      type: http
-      hosts: [localhost]
-      path_prefix: /demo
-      strip_prefix: true
-      request_headers: [accept, content-type, x-request-id, traceparent, tracestate]
-      response_headers: [content-type, x-request-id]
-    - name: echo-tcp
-      type: tcp
-      listen: 127.0.0.1:9000
-    - name: chat-ws
-      type: websocket
-      hosts: [localhost]
-      path_prefix: /chat
-      strip_prefix: true
-      request_headers: [sec-websocket-protocol, x-request-id, traceparent, tracestate]
-      response_headers: [sec-websocket-protocol]
-    - name: grpc-demo
-      type: grpc
-      listen: 127.0.0.1:9001
+  http_addr: 127.0.0.1:8080
+  data_addr: 127.0.0.1:8081
 
 connector:
-  id: local-1
-  edge_tunnel_url: ws://127.0.0.1:8080/_airpc/v1/tunnel
-  routes:
-    - name: demo
-      type: http
-      target: http://127.0.0.1:8081
-      path_prefix: /
-      request_headers: [accept, content-type, x-request-id, traceparent, tracestate]
-      response_headers: [content-type, x-request-id]
-    - name: echo-tcp
-      type: tcp
-      target: 127.0.0.1:7000
-    - name: chat-ws
-      type: websocket
-      target: ws://127.0.0.1:7001
-      path_prefix: /
-      request_headers: [sec-websocket-protocol, x-request-id, traceparent, tracestate]
-      response_headers: [sec-websocket-protocol]
-    - name: grpc-demo
-      type: grpc
-      target: 127.0.0.1:7002
+  edge_data_url: ws://127.0.0.1:8081/_airpc/data
+  tunnel_token: dev-token
+
+routes:
+  - name: demo
+    mode: http
+    public_prefix: /demo
+    target: http://127.0.0.1:9000
+    max_request_body_bytes: 4MiB
+    max_response_body_bytes: 16MiB
+    timeout: 30s
+    forwarded_headers: [accept, content-type, x-request-id]
+
+  - name: echo-tcp
+    mode: tcp
+    listen: 127.0.0.1:7000
+    target: 127.0.0.1:9001
+
+  - name: chat-ws
+    mode: websocket
+    public_path: /chat
+    target: ws://127.0.0.1:9002
+    forwarded_headers: [sec-websocket-protocol, x-request-id]
+
+  - name: grpc-demo
+    mode: grpc
+    listen: 127.0.0.1:7001
+    target: 127.0.0.1:9003
