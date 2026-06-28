@@ -43,16 +43,19 @@ type ConnectorConfig struct {
 }
 
 type Route struct {
-	Name                 string   `yaml:"name"`
-	Mode                 string   `yaml:"mode"`
-	PublicPrefix         string   `yaml:"public_prefix"`
-	PublicPath           string   `yaml:"public_path"`
-	Listen               string   `yaml:"listen"`
-	Target               string   `yaml:"target"`
-	MaxRequestBodyBytes  Bytes    `yaml:"max_request_body_bytes"`
-	MaxResponseBodyBytes Bytes    `yaml:"max_response_body_bytes"`
-	Timeout              Duration `yaml:"timeout"`
-	ForwardedHeaders     []string `yaml:"forwarded_headers"`
+	Name                   string   `yaml:"name"`
+	Mode                   string   `yaml:"mode"`
+	PublicHost             string   `yaml:"public_host"`
+	PublicPrefix           string   `yaml:"public_prefix"`
+	PublicPath             string   `yaml:"public_path"`
+	Listen                 string   `yaml:"listen"`
+	Target                 string   `yaml:"target"`
+	MaxInlineRequestBytes  Bytes    `yaml:"max_inline_request"`
+	MaxInlineResponseBytes Bytes    `yaml:"max_inline_response"`
+	MaxRequestBodyBytes    Bytes    `yaml:"max_request_body_bytes"`
+	MaxResponseBodyBytes   Bytes    `yaml:"max_response_body_bytes"`
+	Timeout                Duration `yaml:"timeout"`
+	ForwardedHeaders       []string `yaml:"forwarded_headers"`
 }
 
 type Duration struct {
@@ -113,15 +116,29 @@ func (c Config) Validate() error {
 }
 
 func (r Route) UnarySubject() string {
-	return "airpc.unary." + r.Name
+	return "airpc.v1.route." + r.Name + ".unary"
 }
 
 func (r Route) OpenSubject() string {
-	return "airpc.open." + r.Name
+	return "airpc.v1.route." + r.Name + ".open"
 }
 
 func (r Route) QueueGroup() string {
-	return "airpc.route." + r.Name
+	return "airpc.route." + r.Name + ".connectors"
+}
+
+func (r Route) MaxInlineRequest() Bytes {
+	if r.MaxInlineRequestBytes > 0 {
+		return r.MaxInlineRequestBytes
+	}
+	return r.MaxRequestBodyBytes
+}
+
+func (r Route) MaxInlineResponse() Bytes {
+	if r.MaxInlineResponseBytes > 0 {
+		return r.MaxInlineResponseBytes
+	}
+	return r.MaxResponseBodyBytes
 }
 
 func (r Route) validate(i int) error {
@@ -140,6 +157,12 @@ func (r Route) validate(i int) error {
 	}
 	if err := validateRoutePublicFields(prefix, r); err != nil {
 		return err
+	}
+	if int64(r.MaxInlineRequestBytes) < 0 {
+		return fmt.Errorf("%s.max_inline_request must not be negative", prefix)
+	}
+	if int64(r.MaxInlineResponseBytes) < 0 {
+		return fmt.Errorf("%s.max_inline_response must not be negative", prefix)
 	}
 	if int64(r.MaxRequestBodyBytes) < 0 {
 		return fmt.Errorf("%s.max_request_body_bytes must not be negative", prefix)
@@ -307,6 +330,9 @@ func validateURLTarget(field, raw string, schemes ...string) error {
 func validateRoutePublicFields(prefix string, r Route) error {
 	switch r.Mode {
 	case ModeHTTP, ModeWebSocket:
+		if r.PublicHost != "" && strings.ContainsAny(r.PublicHost, "/?#") {
+			return fmt.Errorf("%s.public_host must be a host name without scheme, path, query, or fragment", prefix)
+		}
 		if r.PublicPrefix == "" && r.PublicPath == "" {
 			return fmt.Errorf("%s.public_prefix or %s.public_path is required for %s routes", prefix, prefix, r.Mode)
 		}

@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/terion-name/airpc/internal/config"
+	"github.com/terion-name/airpc/internal/connector"
+	"github.com/terion-name/airpc/internal/edge"
 )
 
 func main() {
@@ -56,8 +61,9 @@ func runEdge(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "would start edge: config=%s http_addr=%s data_addr=%s routes=%d\n", *configPath, cfg.Edge.HTTPAddr, cfg.Edge.DataAddr, len(cfg.Routes))
-	return nil
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return edge.Run(ctx, cfg, stdout)
 }
 
 func runConnector(args []string, stdout, stderr io.Writer) error {
@@ -92,6 +98,7 @@ func runConnector(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "would start connector: id=%s config=%s edge_data_url=%s routes=%d\n", *connectorID, *configPath, cfg.Connector.EdgeDataURL, len(cfg.Routes))
-	return nil
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return connector.Run(ctx, cfg, *connectorID, stdout)
 }

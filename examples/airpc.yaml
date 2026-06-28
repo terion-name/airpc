@@ -14,8 +14,8 @@ routes:
     mode: http
     public_prefix: /demo
     target: http://127.0.0.1:9000
-    max_request_body_bytes: 4MiB
-    max_response_body_bytes: 16MiB
+    max_inline_request: 4MiB
+    max_inline_response: 16MiB
     timeout: 30s
     forwarded_headers: [accept, content-type, x-request-id]
 

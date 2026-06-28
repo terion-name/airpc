@@ -7,30 +7,6 @@ import (
 	"testing"
 )
 
-func TestCLIRuntimeCommandsLoadConfigAndPrintPlan(t *testing.T) {
-	path := filepath.Join("..", "..", "examples", "airpc.yaml")
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "edge", args: []string{"edge", "start", "--config", path}, want: "would start edge"},
-		{name: "connector", args: []string{"connector", "start", "--config", path, "--id", "local-1"}, want: "would start connector"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			err := run(tc.args, &stdout, &stderr)
-			if err != nil {
-				t.Fatalf("run(%v): %v (stderr %q)", tc.args, err, stderr.String())
-			}
-			if !strings.Contains(stdout.String(), tc.want) {
-				t.Fatalf("stdout = %q, want %q", stdout.String(), tc.want)
-			}
-		})
-	}
-}
-
 func TestCLIMissingArgs(t *testing.T) {
 	tests := []struct {
 		name string

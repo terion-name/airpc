@@ -32,8 +32,8 @@ func TestLoadExampleConfig(t *testing.T) {
 	if route.Name != "demo" || route.Mode != ModeHTTP {
 		t.Fatalf("first route = %#v", route)
 	}
-	if route.MaxRequestBodyBytes != Bytes(4*1024*1024) {
-		t.Fatalf("max request body bytes = %d", route.MaxRequestBodyBytes)
+	if route.MaxInlineRequest() != Bytes(4*1024*1024) {
+		t.Fatalf("max inline request bytes = %d", route.MaxInlineRequest())
 	}
 	if route.Timeout.Duration != 30*time.Second {
 		t.Fatalf("timeout = %s", route.Timeout.Duration)
@@ -42,13 +42,13 @@ func TestLoadExampleConfig(t *testing.T) {
 
 func TestSubjectDerivation(t *testing.T) {
 	route := Route{Name: "demo"}
-	if got := route.UnarySubject(); got != "airpc.unary.demo" {
+	if got := route.UnarySubject(); got != "airpc.v1.route.demo.unary" {
 		t.Fatalf("UnarySubject() = %q", got)
 	}
-	if got := route.OpenSubject(); got != "airpc.open.demo" {
+	if got := route.OpenSubject(); got != "airpc.v1.route.demo.open" {
 		t.Fatalf("OpenSubject() = %q", got)
 	}
-	if got := route.QueueGroup(); got != "airpc.route.demo" {
+	if got := route.QueueGroup(); got != "airpc.route.demo.connectors" {
 		t.Fatalf("QueueGroup() = %q", got)
 	}
 }
@@ -94,8 +94,8 @@ routes:
     mode: http
     public_prefix: /demo
     target: http://127.0.0.1:9000
-    max_request_body_bytes: 4MiB
-    max_response_body_bytes: 16MiB
+    max_inline_request: 4MiB
+    max_inline_response: 16MiB
     timeout: 30s
     forwarded_headers: [accept, content-type, x-request-id]
   - name: echo-tcp
