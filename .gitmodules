@@ -1,0 +1,3 @@
+[submodule "references/air3"]
+	path = references/air3
+	url = https://github.com/terion-name/air3.git
