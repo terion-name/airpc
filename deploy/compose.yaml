@@ -1,0 +1,110 @@
+name: airpc-e2e
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    networks:
+      - broker
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  edge:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc", "edge", "start", "--config", "/etc/airpc/airpc.yaml"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - public
+      - broker
+    ports:
+      - "8080:8080"
+      - "7000:7000"
+      - "7003:7003"
+    volumes:
+      - ./airpc.yaml:/etc/airpc/airpc.yaml:ro
+    healthcheck:
+      test: ["CMD", "airpc-e2e", "wait-health", "--base-url", "http://127.0.0.1:8080", "--attempts", "1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  connector:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc", "connector", "start", "--config", "/etc/airpc/airpc.yaml", "--id", "compose"]
+    depends_on:
+      edge:
+        condition: service_healthy
+      http-backend:
+        condition: service_started
+      tcp-backend:
+        condition: service_started
+      websocket-backend:
+        condition: service_started
+      grpc-backend:
+        condition: service_started
+    networks:
+      - broker
+      - private
+    volumes:
+      - ./airpc.yaml:/etc/airpc/airpc.yaml:ro
+
+  http-backend:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc-e2e", "backend", "--mode", "http", "--addr", ":9000"]
+    networks:
+      - private
+
+  tcp-backend:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc-e2e", "backend", "--mode", "tcp", "--addr", ":9001"]
+    networks:
+      - private
+
+  websocket-backend:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc-e2e", "backend", "--mode", "websocket", "--addr", ":9002"]
+    networks:
+      - private
+
+  grpc-backend:
+    build:
+      context: ..
+    image: airpc:e2e
+    command: ["airpc-e2e", "backend", "--mode", "grpc", "--addr", ":9003"]
+    networks:
+      - private
+
+  test-runner:
+    build:
+      context: ..
+    image: airpc:e2e
+    profiles: ["tools"]
+    command: ["airpc-e2e", "check", "--base-url", "http://edge:8080", "--tcp-addr", "edge:7000", "--ws-url", "ws://edge:8080/ws", "--grpc-addr", "edge:7003"]
+    depends_on:
+      edge:
+        condition: service_healthy
+    networks:
+      - public
+
+networks:
+  public: {}
+  broker: {}
+  private:
+    internal: true

@@ -1,0 +1,34 @@
+nats:
+  url: nats://nats:4222
+  edge_url: nats://edge:edge-demo-pass@nats:4222
+  connector_url: nats://connector:connector-demo-pass@nats:4222
+edge:
+  http_addr: :8080
+  data_addr: :8081
+connector:
+  edge_data_url: ws://edge:8081/_airpc/data
+  tunnel_token: compose-tunnel-token
+routes:
+  - name: http_echo
+    mode: http
+    public_prefix: /http
+    target: http://http-backend:9000
+    max_inline_request: 64B
+    max_inline_response: 1MiB
+    timeout: 5s
+    forwarded_headers: [content-type, x-airpc-test, x-request-id]
+  - name: tcp_echo
+    mode: tcp
+    listen: :7000
+    target: tcp-backend:9001
+    timeout: 5s
+  - name: ws_echo
+    mode: websocket
+    public_prefix: /ws
+    target: ws://websocket-backend:9002
+    timeout: 5s
+  - name: grpc_echo
+    mode: grpc
+    listen: :7003
+    target: grpc-backend:9003
+    timeout: 5s

@@ -29,7 +29,9 @@ type Config struct {
 }
 
 type NATSConfig struct {
-	URL string `yaml:"url"`
+	URL          string `yaml:"url"`
+	EdgeURL      string `yaml:"edge_url"`
+	ConnectorURL string `yaml:"connector_url"`
 }
 
 type EdgeConfig struct {
@@ -86,8 +88,18 @@ func Load(data []byte) (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if err := validateNATSURL(c.NATS.URL); err != nil {
+	if err := validateNATSURL("nats.url", c.NATS.URL); err != nil {
 		return err
+	}
+	if c.NATS.EdgeURL != "" {
+		if err := validateNATSURL("nats.edge_url", c.NATS.EdgeURL); err != nil {
+			return err
+		}
+	}
+	if c.NATS.ConnectorURL != "" {
+		if err := validateNATSURL("nats.connector_url", c.NATS.ConnectorURL); err != nil {
+			return err
+		}
 	}
 	if err := validateHostPort("edge.http_addr", c.Edge.HTTPAddr); err != nil {
 		return err
@@ -113,6 +125,20 @@ func (c Config) Validate() error {
 		seen[route.Name] = struct{}{}
 	}
 	return nil
+}
+
+func (n NATSConfig) EdgeURLOrDefault() string {
+	if n.EdgeURL != "" {
+		return n.EdgeURL
+	}
+	return n.URL
+}
+
+func (n NATSConfig) ConnectorURLOrDefault() string {
+	if n.ConnectorURL != "" {
+		return n.ConnectorURL
+	}
+	return n.URL
 }
 
 func (r Route) UnarySubject() string {
@@ -263,19 +289,19 @@ func validMode(mode string) bool {
 	}
 }
 
-func validateNATSURL(raw string) error {
+func validateNATSURL(field, raw string) error {
 	if raw == "" {
-		return fmt.Errorf("nats.url is required")
+		return fmt.Errorf("%s is required", field)
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("nats.url must be a valid URL")
+		return fmt.Errorf("%s must be a valid URL", field)
 	}
 	switch u.Scheme {
 	case "nats", "tls", "ws", "wss":
 		return nil
 	default:
-		return fmt.Errorf("nats.url scheme %q is not supported", u.Scheme)
+		return fmt.Errorf("%s scheme %q is not supported", field, u.Scheme)
 	}
 }
 

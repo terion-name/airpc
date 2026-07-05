@@ -69,13 +69,14 @@ func dialConnectorTunnel(ctx context.Context, cfg config.Config, id string, rout
 	}
 	query := u.Query()
 	query.Set("connector_id", id)
-	if cfg.Connector.TunnelToken != "" {
-		query.Set("token", cfg.Connector.TunnelToken)
-	}
 	u.RawQuery = query.Encode()
+	requestHeader := http.Header{}
+	if cfg.Connector.TunnelToken != "" {
+		requestHeader.Set("Authorization", "Bearer "+cfg.Connector.TunnelToken)
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, u.String(), http.Header{})
+	conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, u.String(), requestHeader)
 	if err != nil {
 		return nil, fmt.Errorf("connect data tunnel: %w", err)
 	}
@@ -103,7 +104,7 @@ func (t *connectorTunnel) run(ctx context.Context) {
 			continue
 		}
 		if frame.Type == tunnel.FrameOpen {
-			go t.handleOpen(ctx, frame)
+			t.startOpen(ctx, frame)
 			continue
 		}
 		t.mu.Lock()
@@ -119,7 +120,7 @@ func (t *connectorTunnel) run(ctx context.Context) {
 	}
 }
 
-func (t *connectorTunnel) handleOpen(ctx context.Context, frame tunnel.Frame) {
+func (t *connectorTunnel) startOpen(ctx context.Context, frame tunnel.Frame) {
 	route, ok := t.routes[frame.Route]
 	if !ok || route.cfg.Mode != frame.Kind {
 		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: frame.SessionID, Error: "route is not configured"})
@@ -134,14 +135,16 @@ func (t *connectorTunnel) handleOpen(ctx context.Context, frame tunnel.Frame) {
 	}
 	t.sessions[frame.SessionID] = session
 	t.mu.Unlock()
-	defer t.removeSession(frame.SessionID)
 
-	switch route.cfg.Mode {
-	case config.ModeTCP, config.ModeGRPC:
-		t.handleOpaqueTCP(ctx, route, session)
-	case config.ModeWebSocket:
-		t.handleWebSocket(ctx, route, session, frame.Payload)
-	}
+	go func() {
+		defer t.removeSession(frame.SessionID)
+		switch route.cfg.Mode {
+		case config.ModeTCP, config.ModeGRPC:
+			t.handleOpaqueTCP(ctx, route, session)
+		case config.ModeWebSocket:
+			t.handleWebSocket(ctx, route, session, frame.Payload)
+		}
+	}()
 }
 
 func (t *connectorTunnel) handleOpaqueTCP(ctx context.Context, route streamRoute, session *connectorSession) {

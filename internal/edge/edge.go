@@ -41,7 +41,7 @@ type route struct {
 }
 
 func Start(ctx context.Context, cfg config.Config) (*Server, error) {
-	nc, err := natscore.Connect(cfg.NATS.URL, "airpc-edge")
+	nc, err := natscore.Connect(cfg.NATS.EdgeURLOrDefault(), "airpc-edge")
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +190,12 @@ type handler struct {
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path == "/_airpc/healthz" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+		return
+	}
+
 	if matched, suffix, ok := matchRoute(h.wsRoutes, req); ok {
 		handleWebSocketRoute(req.Context(), h.nats, h.registry, matched, suffix, w, req)
 		return

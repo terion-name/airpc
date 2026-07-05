@@ -60,6 +60,8 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 		want string
 	}{
 		{name: "missing nats url", yaml: strings.Replace(validConfig, "url: nats://127.0.0.1:4222", "url: ''", 1), want: "nats.url"},
+		{name: "bad edge nats url", yaml: strings.Replace(validConfig, "edge_url: nats://edge:pass@127.0.0.1:4222", "edge_url: http://127.0.0.1:4222", 1), want: "nats.edge_url"},
+		{name: "bad connector nats url", yaml: strings.Replace(validConfig, "connector_url: nats://connector:pass@127.0.0.1:4222", "connector_url: http://127.0.0.1:4222", 1), want: "nats.connector_url"},
 		{name: "bad edge address", yaml: strings.Replace(validConfig, "http_addr: 127.0.0.1:8080", "http_addr: 127.0.0.1", 1), want: "edge.http_addr"},
 		{name: "bad connector url", yaml: strings.Replace(validConfig, "ws://127.0.0.1:8081/_airpc/data", "http://127.0.0.1:8081/_airpc/data", 1), want: "connector.edge_data_url"},
 		{name: "bad route name", yaml: strings.Replace(validConfig, "name: demo", "name: bad.route", 1), want: "subject"},
@@ -83,6 +85,8 @@ func TestValidateRejectsBadConfig(t *testing.T) {
 const validConfig = `
 nats:
   url: nats://127.0.0.1:4222
+  edge_url: nats://edge:pass@127.0.0.1:4222
+  connector_url: nats://connector:pass@127.0.0.1:4222
 edge:
   http_addr: 127.0.0.1:8080
   data_addr: 127.0.0.1:8081

@@ -42,7 +42,8 @@ First-product `grpc` mode intentionally preserves the raw HTTP/2/TCP stream. It 
 
 See [`examples/airpc.yaml`](examples/airpc.yaml). Important fields are:
 
-- `nats.url`: NATS server URL used by both edge and connector.
+- `nats.url`: default NATS server URL used by both edge and connector.
+- `nats.edge_url` / `nats.connector_url` (optional): role-specific NATS URLs, useful for separate NATS users and permissions in Compose or production.
 - `edge.http_addr`: HTTP listen address for HTTP unary and public WebSocket routes.
 - `edge.data_addr`: WebSocket tunnel listen address for connector data sessions.
 - `connector.edge_data_url`: connector URL for `edge.data_addr`, normally `ws://<edge-data>/_airpc/data`.
@@ -60,6 +61,16 @@ Derived NATS names:
 - Queue group: `airpc.route.<route>.connectors`
 
 The edge strips hop-by-hop HTTP headers and only forwards HTTP request headers listed in `forwarded_headers`. Response hop-by-hop headers are stripped before writing back to the client. The runtime does not log request/response bodies or Authorization values.
+
+## Docker Compose bench
+
+The Compose bench in [`deploy/compose.yaml`](deploy/compose.yaml) runs NATS, edge, connector, private HTTP/TCP/WebSocket/gRPC backends, and a public-only test runner on separated `public`, `broker`, and internal `private` networks. Run:
+
+```sh
+make e2e
+```
+
+The smoke flow checks normal traffic, public/edge inability to reach private backend addresses directly, connector-down failures, and recovery after restarting the connector.
 
 ## Development
 

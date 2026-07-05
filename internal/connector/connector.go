@@ -40,7 +40,7 @@ func Start(ctx context.Context, cfg config.Config, id string) (*Connector, error
 	if err != nil {
 		return nil, err
 	}
-	nc, err := natscore.Connect(cfg.NATS.URL, "airpc-connector-"+id)
+	nc, err := natscore.Connect(cfg.NATS.ConnectorURLOrDefault(), "airpc-connector-"+id)
 	if err != nil {
 		return nil, err
 	}
