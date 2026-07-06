@@ -2,7 +2,7 @@
 
 **airpc** exposes RPC services and raw sockets that live in a strictly private network — behind a firewall, NAT, or VPN — to public clients or other network zones **without opening a single inbound port** to the private side. Clients keep using their existing HTTP, gRPC, WebSocket, or TCP clients; they only change the endpoint they dial.
 
-It is the sibling of [**air3**](https://github.com/terion-name/air3), which applies the same zero-inbound edge/connector concept to files and objects (S3). The two compose naturally: **airpc carries the calls, air3 carries the bytes** — use airpc for APIs, RPC, and sockets, and air3 when large objects need to cross the same boundary. A copy of air3 is vendored under [`references/air3`](references/air3) as a design reference.
+It is the sibling of [**air3**](https://github.com/terion-name/air3), which applies the same zero-inbound edge/connector concept to files and objects (S3). The two compose naturally: **airpc carries the calls, air3 carries the bytes** — use airpc for APIs, RPC, and sockets, and air3 when large objects need to cross the same boundary.
 
 ## Why
 
