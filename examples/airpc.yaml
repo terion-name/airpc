@@ -1,13 +1,27 @@
 nats:
   url: nats://127.0.0.1:4222
+  # creds_file: /run/secrets/airpc.creds
 
 edge:
   http_addr: 127.0.0.1:8080
   data_addr: 127.0.0.1:8081
+  # Prometheus metrics at /metrics; unauthenticated, keep it private.
+  # metrics_addr: 127.0.0.1:9090
+  # Terminate TLS on the HTTP and data listeners; client_ca_file additionally
+  # requires connector client certificates on the data listener (mTLS).
+  # tls:
+  #   cert_file: /certs/edge.crt
+  #   key_file: /certs/edge.key
+  #   client_ca_file: /certs/ca.crt
 
 connector:
   edge_data_url: ws://127.0.0.1:8081/_airpc/data
   tunnel_token: dev-token
+  # Required trust/identity for a wss:// edge_data_url with a private CA.
+  # tls:
+  #   ca_file: /certs/ca.crt
+  #   cert_file: /certs/connector.crt
+  #   key_file: /certs/connector.key
 
 routes:
   - name: demo
@@ -25,6 +39,9 @@ routes:
     mode: tcp
     listen: 127.0.0.1:7000
     target: 127.0.0.1:9001
+    # Close sessions with no traffic in either direction for this long.
+    # Omit (or 0) to keep idle sessions open indefinitely.
+    idle_timeout: 10m
 
   # WebSocket routes upgrade on edge.http_addr and relay messages to
   # private ws:// or wss:// targets.
