@@ -32,16 +32,43 @@ type NATSConfig struct {
 	URL          string `yaml:"url"`
 	EdgeURL      string `yaml:"edge_url"`
 	ConnectorURL string `yaml:"connector_url"`
+	CredsFile    string `yaml:"creds_file"`
 }
 
 type EdgeConfig struct {
 	HTTPAddr string `yaml:"http_addr"`
 	DataAddr string `yaml:"data_addr"`
+	// MetricsAddr serves Prometheus metrics at /metrics; empty disables it.
+	// Keep it on a private interface — it is not authenticated.
+	MetricsAddr string           `yaml:"metrics_addr"`
+	TLS         *TLSServerConfig `yaml:"tls"`
 }
 
 type ConnectorConfig struct {
 	EdgeDataURL string `yaml:"edge_data_url"`
 	TunnelToken string `yaml:"tunnel_token"`
+	// MetricsAddr serves Prometheus metrics at /metrics; empty disables it.
+	MetricsAddr string           `yaml:"metrics_addr"`
+	TLS         *TLSClientConfig `yaml:"tls"`
+}
+
+// TLSServerConfig terminates TLS on edge listeners. ClientCAFile, when set,
+// additionally requires and verifies client certificates on the data-tunnel
+// listener only (mTLS for connectors); public listeners never demand client
+// certificates.
+type TLSServerConfig struct {
+	CertFile     string `yaml:"cert_file"`
+	KeyFile      string `yaml:"key_file"`
+	ClientCAFile string `yaml:"client_ca_file"`
+}
+
+// TLSClientConfig configures the connector's wss data-tunnel dial: a private
+// CA to trust and an optional client certificate for mTLS.
+type TLSClientConfig struct {
+	CAFile     string `yaml:"ca_file"`
+	CertFile   string `yaml:"cert_file"`
+	KeyFile    string `yaml:"key_file"`
+	ServerName string `yaml:"server_name"`
 }
 
 type Route struct {
@@ -57,7 +84,12 @@ type Route struct {
 	MaxRequestBodyBytes    Bytes    `yaml:"max_request_body_bytes"`
 	MaxResponseBodyBytes   Bytes    `yaml:"max_response_body_bytes"`
 	Timeout                Duration `yaml:"timeout"`
+	IdleTimeout            Duration `yaml:"idle_timeout"`
 	ForwardedHeaders       []string `yaml:"forwarded_headers"`
+	// TLS serves this route's public TCP listener with the edge.tls
+	// certificate. Only valid for tcp/grpc routes; http/websocket routes are
+	// covered by edge.tls on the shared HTTP listener.
+	TLS bool `yaml:"tls"`
 }
 
 type Duration struct {
@@ -110,6 +142,27 @@ func (c Config) Validate() error {
 	if err := validateConnectorURL(c.Connector.EdgeDataURL); err != nil {
 		return err
 	}
+	if c.Edge.MetricsAddr != "" {
+		if err := validateHostPort("edge.metrics_addr", c.Edge.MetricsAddr); err != nil {
+			return err
+		}
+	}
+	if c.Connector.MetricsAddr != "" {
+		if err := validateHostPort("connector.metrics_addr", c.Connector.MetricsAddr); err != nil {
+			return err
+		}
+	}
+	if c.Edge.TLS != nil && (c.Edge.TLS.CertFile == "" || c.Edge.TLS.KeyFile == "") {
+		return fmt.Errorf("edge.tls requires both cert_file and key_file")
+	}
+	if c.Connector.TLS != nil {
+		if (c.Connector.TLS.CertFile == "") != (c.Connector.TLS.KeyFile == "") {
+			return fmt.Errorf("connector.tls requires cert_file and key_file together")
+		}
+		if !strings.HasPrefix(c.Connector.EdgeDataURL, "wss://") {
+			return fmt.Errorf("connector.tls requires a wss:// connector.edge_data_url")
+		}
+	}
 	if len(c.Routes) == 0 {
 		return fmt.Errorf("routes must contain at least one route")
 	}
@@ -118,6 +171,14 @@ func (c Config) Validate() error {
 	for i, route := range c.Routes {
 		if err := route.validate(i); err != nil {
 			return err
+		}
+		if route.TLS {
+			if route.Mode != ModeTCP && route.Mode != ModeGRPC {
+				return fmt.Errorf("routes[%d].tls is only supported for tcp and grpc routes", i)
+			}
+			if c.Edge.TLS == nil {
+				return fmt.Errorf("routes[%d].tls requires edge.tls to be configured", i)
+			}
 		}
 		if _, ok := seen[route.Name]; ok {
 			return fmt.Errorf("routes[%d].name %q is duplicated", i, route.Name)
@@ -151,6 +212,25 @@ func (r Route) OpenSubject() string {
 
 func (r Route) QueueGroup() string {
 	return "airpc.route." + r.Name + ".connectors"
+}
+
+const cancelSubjectPrefix = "airpc.v1.cancel."
+
+// CancelSubjectWildcard is subscribed by connectors to observe all cancels.
+const CancelSubjectWildcard = cancelSubjectPrefix + ">"
+
+func CancelSubject(requestID string) string {
+	return cancelSubjectPrefix + requestID
+}
+
+// RequestIDFromCancelSubject extracts and validates the request ID token of a
+// cancel subject; ok is false for foreign or malformed subjects.
+func RequestIDFromCancelSubject(subject string) (string, bool) {
+	requestID := strings.TrimPrefix(subject, cancelSubjectPrefix)
+	if requestID == subject || ValidateSubjectToken("request_id", requestID) != nil {
+		return "", false
+	}
+	return requestID, true
 }
 
 func (r Route) MaxInlineRequest() Bytes {
@@ -198,6 +278,9 @@ func (r Route) validate(i int) error {
 	}
 	if r.Timeout.Duration < 0 {
 		return fmt.Errorf("%s.timeout must not be negative", prefix)
+	}
+	if r.IdleTimeout.Duration < 0 {
+		return fmt.Errorf("%s.idle_timeout must not be negative", prefix)
 	}
 	for j, header := range r.ForwardedHeaders {
 		if !validHeaderName(header) {

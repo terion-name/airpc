@@ -26,13 +26,19 @@ type Request struct {
 }
 
 // Response is the MessagePack envelope sent from connector to edge.
+//
+// When StreamSessionID is set the body is not inline: the connector has
+// opened an http-stream session with that ID on its data tunnel (identified
+// by ConnectorID), and the edge relays the body from there.
 type Response struct {
-	Version   int         `msgpack:"version"`
-	RequestID string      `msgpack:"request_id"`
-	Status    int         `msgpack:"status"`
-	Headers   http.Header `msgpack:"headers"`
-	Body      []byte      `msgpack:"body"`
-	Error     *Error      `msgpack:"error,omitempty"`
+	Version         int         `msgpack:"version"`
+	RequestID       string      `msgpack:"request_id"`
+	Status          int         `msgpack:"status"`
+	Headers         http.Header `msgpack:"headers"`
+	Body            []byte      `msgpack:"body"`
+	StreamSessionID string      `msgpack:"stream_session_id,omitempty"`
+	ConnectorID     string      `msgpack:"connector_id,omitempty"`
+	Error           *Error      `msgpack:"error,omitempty"`
 }
 
 type Error struct {
@@ -124,6 +130,17 @@ func (r Response) Validate() error {
 	}
 	if r.Status < 100 || r.Status > 999 {
 		return fmt.Errorf("HTTP unary response status %d is invalid", r.Status)
+	}
+	if r.StreamSessionID != "" {
+		if !validToken(r.StreamSessionID) {
+			return fmt.Errorf("HTTP unary response stream_session_id is invalid")
+		}
+		if !validToken(r.ConnectorID) {
+			return fmt.Errorf("HTTP unary response connector_id is invalid")
+		}
+		if len(r.Body) != 0 {
+			return fmt.Errorf("HTTP unary response cannot carry both inline body and stream session")
+		}
 	}
 	return validateHeaders(r.Headers)
 }

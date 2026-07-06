@@ -28,8 +28,15 @@ type Subscription struct {
 	sub *nats.Subscription
 }
 
-func Connect(url, name string) (*Client, error) {
-	nc, err := nats.Connect(url, nats.Name(name))
+// Connect dials NATS with unlimited reconnects; credsFile, when non-empty,
+// points to a NATS .creds file used for authentication. The initial connect
+// still fails fast so misconfiguration surfaces at startup.
+func Connect(url, name, credsFile string) (*Client, error) {
+	opts := []nats.Option{nats.Name(name), nats.MaxReconnects(-1)}
+	if credsFile != "" {
+		opts = append(opts, nats.UserCredentials(credsFile))
+	}
+	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect NATS: %w", err)
 	}
@@ -42,6 +49,24 @@ func (c *Client) Request(ctx context.Context, subject string, data []byte) ([]by
 		return nil, err
 	}
 	return msg.Data, nil
+}
+
+func (c *Client) Publish(subject string, data []byte) error {
+	return c.nc.Publish(subject, data)
+}
+
+func (c *Client) Subscribe(subject string, handler func(Msg)) (*Subscription, error) {
+	sub, err := c.nc.Subscribe(subject, func(msg *nats.Msg) {
+		handler(Msg{Subject: msg.Subject, Reply: msg.Reply, Data: msg.Data, msg: msg})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("subscribe %s: %w", subject, err)
+	}
+	if err := c.nc.Flush(); err != nil {
+		_ = sub.Unsubscribe()
+		return nil, fmt.Errorf("flush subscription %s: %w", subject, err)
+	}
+	return &Subscription{sub: sub}, nil
 }
 
 func (c *Client) QueueSubscribe(subject, queue string, handler func(Msg)) (*Subscription, error) {

@@ -10,151 +10,62 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/terion-name/airpc/internal/config"
+	"github.com/terion-name/airpc/internal/datatunnel"
+	"github.com/terion-name/airpc/internal/grpcobs"
 	"github.com/terion-name/airpc/internal/natscore"
 	"github.com/terion-name/airpc/internal/protocol/tunnel"
+	"github.com/terion-name/airpc/internal/telemetry"
 )
 
 const dataTunnelPath = "/_airpc/data"
 
+// tunnelRegistry tracks the active data-tunnel link per connector ID.
 type tunnelRegistry struct {
-	mu      sync.RWMutex
-	tunnels map[string]*edgeTunnel
+	mu    sync.RWMutex
+	links map[string]*datatunnel.Link
 }
 
 func newTunnelRegistry() *tunnelRegistry {
-	return &tunnelRegistry{tunnels: make(map[string]*edgeTunnel)}
+	return &tunnelRegistry{links: make(map[string]*datatunnel.Link)}
 }
 
-func (r *tunnelRegistry) register(connectorID string, t *edgeTunnel) {
+func (r *tunnelRegistry) register(connectorID string, link *datatunnel.Link) {
 	r.mu.Lock()
-	old := r.tunnels[connectorID]
-	r.tunnels[connectorID] = t
+	old := r.links[connectorID]
+	r.links[connectorID] = link
 	r.mu.Unlock()
 	if old != nil {
-		old.close()
+		old.Close()
 	}
 }
 
-func (r *tunnelRegistry) unregister(connectorID string, t *edgeTunnel) {
+func (r *tunnelRegistry) unregister(connectorID string, link *datatunnel.Link) {
 	r.mu.Lock()
-	if r.tunnels[connectorID] == t {
-		delete(r.tunnels, connectorID)
+	if r.links[connectorID] == link {
+		delete(r.links, connectorID)
 	}
 	r.mu.Unlock()
 }
 
-func (r *tunnelRegistry) get(connectorID string) *edgeTunnel {
+func (r *tunnelRegistry) get(connectorID string) *datatunnel.Link {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.tunnels[connectorID]
+	return r.links[connectorID]
 }
 
-type edgeTunnel struct {
-	connectorID string
-	conn        *websocket.Conn
-	registry    *tunnelRegistry
-
-	writeMu  sync.Mutex
-	mu       sync.Mutex
-	sessions map[string]*edgeSession
-}
-
-type edgeSession struct {
-	id   string
-	recv chan tunnel.Frame
-	done chan struct{}
-	once sync.Once
-}
-
-func newEdgeTunnel(connectorID string, conn *websocket.Conn, registry *tunnelRegistry) *edgeTunnel {
-	return &edgeTunnel{connectorID: connectorID, conn: conn, registry: registry, sessions: make(map[string]*edgeSession)}
-}
-
-func (t *edgeTunnel) run() {
-	defer func() {
-		t.registry.unregister(t.connectorID, t)
-		t.closeSessions()
-		_ = t.conn.Close()
-	}()
-	for {
-		messageType, data, err := t.conn.ReadMessage()
-		if err != nil {
-			return
-		}
-		if messageType != websocket.BinaryMessage {
-			continue
-		}
-		frame, err := tunnel.DecodeFrame(data)
-		if err != nil {
-			continue
-		}
-		t.mu.Lock()
-		session := t.sessions[frame.SessionID]
-		t.mu.Unlock()
-		if session != nil {
-			select {
-			case session.recv <- frame:
-			case <-session.done:
-			default:
-			}
-		}
+// closeAll drops every tunnel. HTTP server shutdown does not close hijacked
+// WebSocket connections, so edge shutdown must do it here for connectors to
+// notice and redial.
+func (r *tunnelRegistry) closeAll() {
+	r.mu.Lock()
+	links := r.links
+	r.links = make(map[string]*datatunnel.Link)
+	r.mu.Unlock()
+	for _, link := range links {
+		link.Close()
 	}
-}
-
-func (t *edgeTunnel) openSession(frame tunnel.Frame) (*edgeSession, error) {
-	session := &edgeSession{id: frame.SessionID, recv: make(chan tunnel.Frame, 16), done: make(chan struct{})}
-	t.mu.Lock()
-	if _, exists := t.sessions[frame.SessionID]; exists {
-		t.mu.Unlock()
-		return nil, fmt.Errorf("session %s already exists", frame.SessionID)
-	}
-	t.sessions[frame.SessionID] = session
-	t.mu.Unlock()
-	if err := t.write(frame); err != nil {
-		t.removeSession(frame.SessionID)
-		return nil, err
-	}
-	return session, nil
-}
-
-func (t *edgeTunnel) write(frame tunnel.Frame) error {
-	data, err := tunnel.EncodeFrame(frame)
-	if err != nil {
-		return err
-	}
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return t.conn.WriteMessage(websocket.BinaryMessage, data)
-}
-
-func (t *edgeTunnel) removeSession(sessionID string) {
-	t.mu.Lock()
-	session := t.sessions[sessionID]
-	delete(t.sessions, sessionID)
-	t.mu.Unlock()
-	if session != nil {
-		session.close()
-	}
-}
-
-func (t *edgeTunnel) closeSessions() {
-	t.mu.Lock()
-	sessions := t.sessions
-	t.sessions = make(map[string]*edgeSession)
-	t.mu.Unlock()
-	for _, session := range sessions {
-		session.close()
-	}
-}
-
-func (t *edgeTunnel) close() {
-	_ = t.conn.Close()
-	t.closeSessions()
-}
-
-func (s *edgeSession) close() {
-	s.once.Do(func() { close(s.done) })
 }
 
 type dataHandler struct {
@@ -184,9 +95,51 @@ func (h dataHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		return
 	}
-	t := newEdgeTunnel(connectorID, conn, h.registry)
-	h.registry.register(connectorID, t)
-	t.run()
+	var link *datatunnel.Link
+	link = datatunnel.NewLink(conn, func(frame tunnel.Frame) { acceptStreamOpen(link, frame) })
+	h.registry.register(connectorID, link)
+	link.Run()
+	h.registry.unregister(connectorID, link)
+}
+
+// streamClaimTimeout bounds how long a connector-initiated http-stream
+// session may sit unclaimed (its NATS reply lost or the unary handler gone)
+// before the edge discards it.
+const streamClaimTimeout = 10 * time.Second
+
+// acceptStreamOpen registers connector-initiated response-stream sessions so
+// the unary handler that receives the matching NATS reply can claim them.
+func acceptStreamOpen(link *datatunnel.Link, frame tunnel.Frame) {
+	if frame.Kind != tunnel.KindHTTPStream {
+		return
+	}
+	session, err := link.Accept(frame.SessionID)
+	if err != nil {
+		return
+	}
+	time.AfterFunc(streamClaimTimeout, func() {
+		if !session.Claimed() {
+			session.CloseWithError("response stream was not claimed")
+		}
+	})
+}
+
+// claimStreamSession waits briefly for the http-stream FrameOpen to arrive
+// (it races the NATS reply) and claims the session for the calling handler.
+func claimStreamSession(link *datatunnel.Link, sessionID string) *datatunnel.Session {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if session := link.Session(sessionID); session != nil {
+			if session.TryClaim() {
+				return session
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func tcpRoutes(routes []config.Route) []config.Route {
@@ -209,10 +162,34 @@ func wsRoutes(routes []config.Route) []route {
 	return sortRoutes(out)
 }
 
-func openDataSession(ctx context.Context, nc *natscore.Client, registry *tunnelRegistry, r config.Route, sessionID, path string) (*edgeTunnel, *edgeSession, error) {
-	timeout := routeTimeout(r)
-	openCtx, cancel := context.WithTimeout(ctx, timeout)
+// errTunnelUnavailable marks transient open failures: the drawn connector's
+// data tunnel is down, or its tunnel dropped between accept and open. Another
+// queue member may succeed, so these are retried until the open timeout.
+var errTunnelUnavailable = errors.New(tunnel.ErrTunnelNotConnected)
+
+// openDataSession selects a connector for the route over NATS, then opens a
+// session on that connector's data tunnel, retrying transient tunnel-down
+// rejections until the route timeout expires.
+func openDataSession(ctx context.Context, nc *natscore.Client, registry *tunnelRegistry, r config.Route, sessionID, path string) (*datatunnel.Session, error) {
+	openCtx, cancel := context.WithTimeout(ctx, routeTimeout(r))
 	defer cancel()
+	for {
+		session, err := attemptOpenDataSession(openCtx, nc, registry, r, sessionID, path)
+		if err == nil {
+			return session, nil
+		}
+		if !errors.Is(err, errTunnelUnavailable) {
+			return nil, err
+		}
+		select {
+		case <-openCtx.Done():
+			return nil, err
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func attemptOpenDataSession(openCtx context.Context, nc *natscore.Client, registry *tunnelRegistry, r config.Route, sessionID, path string) (*datatunnel.Session, error) {
 	deadline, _ := openCtx.Deadline()
 	req := tunnel.OpenRequest{
 		Version:        tunnel.Version,
@@ -225,32 +202,31 @@ func openDataSession(ctx context.Context, nc *natscore.Client, registry *tunnelR
 	}
 	payload, err := tunnel.EncodeOpenRequest(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	reply, err := nc.Request(openCtx, r.OpenSubject(), payload)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	resp, err := tunnel.DecodeOpenResponse(reply)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if resp.RequestID != sessionID || !resp.Accepted {
+		if resp.Error == tunnel.ErrTunnelNotConnected {
+			return nil, errTunnelUnavailable
+		}
 		if resp.Error == "" {
 			resp.Error = "open rejected"
 		}
-		return nil, nil, errors.New(resp.Error)
+		return nil, errors.New(resp.Error)
 	}
-	edgeTunnel := registry.get(resp.ConnectorID)
-	if edgeTunnel == nil {
-		return nil, nil, fmt.Errorf("connector %s has no active data tunnel", resp.ConnectorID)
+	link := registry.get(resp.ConnectorID)
+	if link == nil {
+		return nil, fmt.Errorf("connector %s has no registered data tunnel: %w", resp.ConnectorID, errTunnelUnavailable)
 	}
 	frame := tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameOpen, SessionID: sessionID, Route: r.Name, Kind: r.Mode, Payload: []byte(path)}
-	session, err := edgeTunnel.openSession(frame)
-	if err != nil {
-		return nil, nil, err
-	}
-	return edgeTunnel, session, nil
+	return link.Open(frame)
 }
 
 func serveTCPRoute(ctx context.Context, nc *natscore.Client, registry *tunnelRegistry, r config.Route, listener net.Listener) error {
@@ -267,54 +243,79 @@ func serveTCPRoute(ctx context.Context, nc *natscore.Client, registry *tunnelReg
 }
 
 func handleTCPConn(ctx context.Context, nc *natscore.Client, registry *tunnelRegistry, r config.Route, conn net.Conn) {
-	defer conn.Close()
 	sessionID, err := requestID()
 	if err != nil {
+		_ = conn.Close()
 		return
 	}
-	edgeTunnel, session, err := openDataSession(ctx, nc, registry, r, sessionID, "/")
+	session, err := openDataSession(ctx, nc, registry, r, sessionID, "/")
 	if err != nil {
+		_ = conn.Close()
 		return
 	}
-	defer edgeTunnel.removeSession(sessionID)
-	defer edgeTunnel.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameClose, SessionID: sessionID})
+	telemetry.StreamSessionsTotal.WithLabelValues(r.Name, r.Mode).Inc()
+	active := telemetry.StreamSessionsActive.WithLabelValues(r.Name, r.Mode)
+	active.Inc()
+	defer active.Dec()
 
-	clientDone := make(chan struct{})
-	go func() {
-		defer close(clientDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				frame := tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameData, SessionID: sessionID, DataKind: tunnel.DataBinary, Payload: append([]byte(nil), buf[:n]...)}
-				if writeErr := edgeTunnel.write(frame); writeErr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	observed := observeConn(conn, r)
+	defer observed.finish()
+	datatunnel.RelayConn(ctx, session, observed, r.IdleTimeout.Duration)
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-clientDone:
-			return
-		case <-session.done:
-			return
-		case frame := <-session.recv:
-			switch frame.Type {
-			case tunnel.FrameData:
-				if _, err := conn.Write(frame.Payload); err != nil {
-					return
-				}
-			case tunnel.FrameClose, tunnel.FrameError:
-				return
-			}
+// observedConn counts relayed bytes and, on grpc routes, feeds a passive
+// gRPC observer. It must keep exposing CloseWrite so half-close propagation
+// still reaches the wrapped connection.
+type observedConn struct {
+	net.Conn
+	in, out  prometheus.Counter
+	observer *grpcobs.Observer // nil on non-grpc routes
+}
+
+func observeConn(conn net.Conn, r config.Route) *observedConn {
+	o := &observedConn{
+		Conn: conn,
+		in:   telemetry.StreamBytes.WithLabelValues(r.Name, "in"),
+		out:  telemetry.StreamBytes.WithLabelValues(r.Name, "out"),
+	}
+	if r.Mode == config.ModeGRPC {
+		o.observer = grpcobs.New(r.Name)
+	}
+	return o
+}
+
+func (c *observedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.in.Add(float64(n))
+		if c.observer != nil {
+			c.observer.ClientBytes(p[:n])
 		}
+	}
+	return n, err
+}
+
+func (c *observedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.out.Add(float64(n))
+		if c.observer != nil {
+			c.observer.BackendBytes(p[:n])
+		}
+	}
+	return n, err
+}
+
+func (c *observedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c *observedConn) finish() {
+	if c.observer != nil {
+		c.observer.Close()
 	}
 }
 
@@ -324,65 +325,24 @@ func handleWebSocketRoute(ctx context.Context, nc *natscore.Client, registry *tu
 	if err != nil {
 		return
 	}
-	defer client.Close()
 
 	sessionID, err := requestID()
 	if err != nil {
 		_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "session id"), time.Now().Add(time.Second))
+		_ = client.Close()
 		return
 	}
-	edgeTunnel, session, err := openDataSession(req.Context(), nc, registry, r.cfg, sessionID, suffix)
+	session, err := openDataSession(req.Context(), nc, registry, r.cfg, sessionID, suffix)
 	if err != nil {
 		_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "connector unavailable"), time.Now().Add(time.Second))
+		_ = client.Close()
 		return
 	}
-	defer edgeTunnel.removeSession(sessionID)
-	defer edgeTunnel.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameClose, SessionID: sessionID})
-
-	clientDone := make(chan struct{})
-	go func() {
-		defer close(clientDone)
-		for {
-			messageType, payload, err := client.ReadMessage()
-			if err != nil {
-				return
-			}
-			dataKind := tunnel.DataBinary
-			if messageType == websocket.TextMessage {
-				dataKind = tunnel.DataText
-			} else if messageType != websocket.BinaryMessage {
-				continue
-			}
-			frame := tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameData, SessionID: sessionID, DataKind: dataKind, Payload: payload}
-			if err := edgeTunnel.write(frame); err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-clientDone:
-			return
-		case <-session.done:
-			return
-		case frame := <-session.recv:
-			switch frame.Type {
-			case tunnel.FrameData:
-				messageType := websocket.BinaryMessage
-				if frame.DataKind == tunnel.DataText {
-					messageType = websocket.TextMessage
-				}
-				if err := client.WriteMessage(messageType, frame.Payload); err != nil {
-					return
-				}
-			case tunnel.FrameClose, tunnel.FrameError:
-				return
-			}
-		}
-	}
+	telemetry.StreamSessionsTotal.WithLabelValues(r.cfg.Name, r.cfg.Mode).Inc()
+	active := telemetry.StreamSessionsActive.WithLabelValues(r.cfg.Name, r.cfg.Mode)
+	active.Inc()
+	defer active.Dec()
+	datatunnel.RelayWebSocket(ctx, session, client, r.cfg.IdleTimeout.Duration)
 }
 
 func closeListeners(listeners []net.Listener) {

@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -11,33 +12,23 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/terion-name/airpc/internal/config"
+	"github.com/terion-name/airpc/internal/datatunnel"
 	"github.com/terion-name/airpc/internal/protocol/tunnel"
+	"github.com/terion-name/airpc/internal/telemetry"
+)
+
+const (
+	tunnelDialTimeout = 10 * time.Second
+	// reconnectBackoffMax caps the exponential redial backoff; a connection
+	// that stayed up longer than reconnectStableAfter resets the backoff.
+	reconnectBackoffMin  = 250 * time.Millisecond
+	reconnectBackoffMax  = 5 * time.Second
+	reconnectStableAfter = 30 * time.Second
 )
 
 type streamRoute struct {
 	cfg    config.Route
 	target *url.URL
-}
-
-type connectorTunnel struct {
-	id     string
-	conn   *websocket.Conn
-	routes map[string]streamRoute
-
-	writeMu  sync.Mutex
-	mu       sync.Mutex
-	sessions map[string]*connectorSession
-}
-
-type connectorSession struct {
-	id   string
-	recv chan tunnel.Frame
-	done chan struct{}
-	once sync.Once
-}
-
-func (s *connectorSession) close() {
-	s.once.Do(func() { close(s.done) })
 }
 
 func streamRoutes(routes []config.Route) (map[string]streamRoute, error) {
@@ -59,10 +50,27 @@ func streamRoutes(routes []config.Route) (map[string]streamRoute, error) {
 	return out, nil
 }
 
-func dialConnectorTunnel(ctx context.Context, cfg config.Config, id string, routes map[string]streamRoute) (*connectorTunnel, error) {
-	if len(routes) == 0 {
-		return nil, nil
-	}
+// tunnelClient owns the connector's outbound data WebSocket and keeps it
+// alive: it redials with exponential backoff whenever the link drops, for the
+// life of the context. While disconnected, open requests are rejected over
+// NATS so the edge fails fast instead of finding a dead tunnel.
+type tunnelClient struct {
+	id      string
+	dialURL string
+	token   string
+	dialer  *websocket.Dialer
+	routes  map[string]streamRoute
+
+	mu   sync.Mutex
+	link *datatunnel.Link // nil while disconnected
+}
+
+// startTunnelClient dials the edge data tunnel; even HTTP-only connectors
+// need it to stream large or SSE responses. It waits for the first dial
+// attempt to finish (either way) so that a healthy setup is connected on
+// return; network failures are then retried in the background rather than
+// failing connector startup.
+func startTunnelClient(ctx context.Context, cfg config.Config, id string, routes map[string]streamRoute) (*tunnelClient, error) {
 	u, err := url.Parse(cfg.Connector.EdgeDataURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse edge data url: %w", err)
@@ -70,221 +78,170 @@ func dialConnectorTunnel(ctx context.Context, cfg config.Config, id string, rout
 	query := u.Query()
 	query.Set("connector_id", id)
 	u.RawQuery = query.Encode()
-	requestHeader := http.Header{}
-	if cfg.Connector.TunnelToken != "" {
-		requestHeader.Set("Authorization", "Bearer "+cfg.Connector.TunnelToken)
+
+	dialer := *websocket.DefaultDialer
+	if cfg.Connector.TLS != nil {
+		tlsCfg, err := cfg.Connector.TLS.ClientTLS()
+		if err != nil {
+			return nil, err
+		}
+		dialer.TLSClientConfig = tlsCfg
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, u.String(), requestHeader)
-	if err != nil {
-		return nil, fmt.Errorf("connect data tunnel: %w", err)
+	c := &tunnelClient{id: id, dialURL: u.String(), token: cfg.Connector.TunnelToken, dialer: &dialer, routes: routes}
+	firstAttempt := make(chan struct{})
+	go c.run(ctx, firstAttempt)
+	select {
+	case <-firstAttempt:
+	case <-ctx.Done():
 	}
-	ct := &connectorTunnel{id: id, conn: conn, routes: routes, sessions: make(map[string]*connectorSession)}
-	go ct.run(ctx)
-	return ct, nil
+	return c, nil
 }
 
-func (t *connectorTunnel) run(ctx context.Context) {
-	go func() {
-		<-ctx.Done()
-		_ = t.conn.Close()
-	}()
-	defer t.closeSessions()
+func (c *tunnelClient) run(ctx context.Context, firstAttempt chan<- struct{}) {
+	attemptDone := func() {
+		if firstAttempt != nil {
+			close(firstAttempt)
+			firstAttempt = nil
+		}
+	}
+	var backoff time.Duration // zero: dial immediately
 	for {
-		messageType, data, err := t.conn.ReadMessage()
-		if err != nil {
-			return
-		}
-		if messageType != websocket.BinaryMessage {
-			continue
-		}
-		frame, err := tunnel.DecodeFrame(data)
-		if err != nil {
-			continue
-		}
-		if frame.Type == tunnel.FrameOpen {
-			t.startOpen(ctx, frame)
-			continue
-		}
-		t.mu.Lock()
-		session := t.sessions[frame.SessionID]
-		t.mu.Unlock()
-		if session != nil {
+		if backoff > 0 {
 			select {
-			case session.recv <- frame:
-			case <-session.done:
-			default:
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
 			}
 		}
-	}
-}
-
-func (t *connectorTunnel) startOpen(ctx context.Context, frame tunnel.Frame) {
-	route, ok := t.routes[frame.Route]
-	if !ok || route.cfg.Mode != frame.Kind {
-		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: frame.SessionID, Error: "route is not configured"})
-		return
-	}
-	session := &connectorSession{id: frame.SessionID, recv: make(chan tunnel.Frame, 16), done: make(chan struct{})}
-	t.mu.Lock()
-	if _, exists := t.sessions[frame.SessionID]; exists {
-		t.mu.Unlock()
-		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: frame.SessionID, Error: "session already exists"})
-		return
-	}
-	t.sessions[frame.SessionID] = session
-	t.mu.Unlock()
-
-	go func() {
-		defer t.removeSession(frame.SessionID)
-		switch route.cfg.Mode {
-		case config.ModeTCP, config.ModeGRPC:
-			t.handleOpaqueTCP(ctx, route, session)
-		case config.ModeWebSocket:
-			t.handleWebSocket(ctx, route, session, frame.Payload)
-		}
-	}()
-}
-
-func (t *connectorTunnel) handleOpaqueTCP(ctx context.Context, route streamRoute, session *connectorSession) {
-	backend, err := (&net.Dialer{}).DialContext(ctx, "tcp", route.cfg.Target)
-	if err != nil {
-		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: session.id, Error: "backend dial failed"})
-		return
-	}
-	defer backend.Close()
-	defer t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameClose, SessionID: session.id})
-
-	backendDone := make(chan struct{})
-	go func() {
-		defer close(backendDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := backend.Read(buf)
-			if n > 0 {
-				frame := tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameData, SessionID: session.id, DataKind: tunnel.DataBinary, Payload: append([]byte(nil), buf[:n]...)}
-				if writeErr := t.write(frame); writeErr != nil {
-					return
-				}
-			}
-			if err != nil {
+		connectedAt := time.Now()
+		link, err := c.dial(ctx)
+		if err != nil {
+			attemptDone()
+			if ctx.Err() != nil {
 				return
 			}
+			telemetry.TunnelDials.WithLabelValues(c.id, "failed").Inc()
+			log.Printf("airpc connector %s: data tunnel dial failed: %v", c.id, err)
+			backoff = nextBackoff(backoff)
+			continue
 		}
-	}()
+		c.setLink(link)
+		telemetry.TunnelDials.WithLabelValues(c.id, "connected").Inc()
+		telemetry.TunnelConnected.WithLabelValues(c.id).Set(1)
+		log.Printf("airpc connector %s: data tunnel connected", c.id)
+		attemptDone()
 
-	for {
+		runDone := make(chan struct{})
+		go func() {
+			link.Run()
+			close(runDone)
+		}()
 		select {
 		case <-ctx.Done():
+			link.Close()
+			<-runDone
+			c.setLink(nil)
+			telemetry.TunnelConnected.WithLabelValues(c.id).Set(0)
 			return
-		case <-backendDone:
-			return
-		case <-session.done:
-			return
-		case frame := <-session.recv:
-			switch frame.Type {
-			case tunnel.FrameData:
-				if _, err := backend.Write(frame.Payload); err != nil {
-					return
-				}
-			case tunnel.FrameClose, tunnel.FrameError:
-				return
-			}
+		case <-runDone:
+		}
+		c.setLink(nil)
+		telemetry.TunnelConnected.WithLabelValues(c.id).Set(0)
+		log.Printf("airpc connector %s: data tunnel disconnected", c.id)
+		if time.Since(connectedAt) > reconnectStableAfter {
+			backoff = 0
+		} else {
+			backoff = nextBackoff(backoff)
 		}
 	}
 }
 
-func (t *connectorTunnel) handleWebSocket(ctx context.Context, route streamRoute, session *connectorSession, payload []byte) {
-	path := string(payload)
+func nextBackoff(current time.Duration) time.Duration {
+	if current == 0 {
+		return reconnectBackoffMin
+	}
+	next := current * 2
+	if next > reconnectBackoffMax {
+		next = reconnectBackoffMax
+	}
+	return next
+}
+
+func (c *tunnelClient) dial(ctx context.Context) (*datatunnel.Link, error) {
+	requestHeader := http.Header{}
+	if c.token != "" {
+		requestHeader.Set("Authorization", "Bearer "+c.token)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, tunnelDialTimeout)
+	defer cancel()
+	conn, _, err := c.dialer.DialContext(dialCtx, c.dialURL, requestHeader)
+	if err != nil {
+		return nil, err
+	}
+	var link *datatunnel.Link
+	link = datatunnel.NewLink(conn, func(frame tunnel.Frame) { c.handleOpen(ctx, link, frame) })
+	return link, nil
+}
+
+func (c *tunnelClient) setLink(link *datatunnel.Link) {
+	c.mu.Lock()
+	c.link = link
+	c.mu.Unlock()
+}
+
+func (c *tunnelClient) connected() bool {
+	return c.currentLink() != nil
+}
+
+func (c *tunnelClient) currentLink() *datatunnel.Link {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.link
+}
+
+func (c *tunnelClient) handleOpen(ctx context.Context, link *datatunnel.Link, frame tunnel.Frame) {
+	route, ok := c.routes[frame.Route]
+	if !ok || route.cfg.Mode != frame.Kind {
+		_ = link.WriteFrame(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: frame.SessionID, Error: "route is not configured"})
+		return
+	}
+	session, err := link.Accept(frame.SessionID)
+	if err != nil {
+		_ = link.WriteFrame(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: frame.SessionID, Error: "session already exists"})
+		return
+	}
+	go func() {
+		switch route.cfg.Mode {
+		case config.ModeTCP, config.ModeGRPC:
+			relayTCPBackend(ctx, route, session)
+		case config.ModeWebSocket:
+			relayWebSocketBackend(ctx, route, session, string(frame.Payload))
+		}
+	}()
+}
+
+func relayTCPBackend(ctx context.Context, route streamRoute, session *datatunnel.Session) {
+	backend, err := (&net.Dialer{}).DialContext(ctx, "tcp", route.cfg.Target)
+	if err != nil {
+		session.CloseWithError("backend dial failed")
+		return
+	}
+	datatunnel.RelayConn(ctx, session, backend, route.cfg.IdleTimeout.Duration)
+}
+
+func relayWebSocketBackend(ctx context.Context, route streamRoute, session *datatunnel.Session, path string) {
 	if path == "" {
 		path = "/"
 	}
 	target, err := targetURL(route.target, path)
 	if err != nil {
-		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: session.id, Error: "invalid websocket path"})
+		session.CloseWithError("invalid websocket path")
 		return
 	}
 	backend, _, err := websocket.DefaultDialer.DialContext(ctx, target.String(), http.Header{})
 	if err != nil {
-		_ = t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameError, SessionID: session.id, Error: "backend websocket dial failed"})
+		session.CloseWithError("backend websocket dial failed")
 		return
 	}
-	defer backend.Close()
-	defer t.write(tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameClose, SessionID: session.id})
-
-	backendDone := make(chan struct{})
-	go func() {
-		defer close(backendDone)
-		for {
-			messageType, payload, err := backend.ReadMessage()
-			if err != nil {
-				return
-			}
-			dataKind := tunnel.DataBinary
-			if messageType == websocket.TextMessage {
-				dataKind = tunnel.DataText
-			} else if messageType != websocket.BinaryMessage {
-				continue
-			}
-			frame := tunnel.Frame{Version: tunnel.Version, Type: tunnel.FrameData, SessionID: session.id, DataKind: dataKind, Payload: payload}
-			if err := t.write(frame); err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-backendDone:
-			return
-		case <-session.done:
-			return
-		case frame := <-session.recv:
-			switch frame.Type {
-			case tunnel.FrameData:
-				messageType := websocket.BinaryMessage
-				if frame.DataKind == tunnel.DataText {
-					messageType = websocket.TextMessage
-				}
-				if err := backend.WriteMessage(messageType, frame.Payload); err != nil {
-					return
-				}
-			case tunnel.FrameClose, tunnel.FrameError:
-				return
-			}
-		}
-	}
-}
-
-func (t *connectorTunnel) write(frame tunnel.Frame) error {
-	data, err := tunnel.EncodeFrame(frame)
-	if err != nil {
-		return err
-	}
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	return t.conn.WriteMessage(websocket.BinaryMessage, data)
-}
-
-func (t *connectorTunnel) removeSession(sessionID string) {
-	t.mu.Lock()
-	session := t.sessions[sessionID]
-	delete(t.sessions, sessionID)
-	t.mu.Unlock()
-	if session != nil {
-		session.close()
-	}
-}
-
-func (t *connectorTunnel) closeSessions() {
-	t.mu.Lock()
-	sessions := t.sessions
-	t.sessions = make(map[string]*connectorSession)
-	t.mu.Unlock()
-	for _, session := range sessions {
-		session.close()
-	}
+	datatunnel.RelayWebSocket(ctx, session, backend, route.cfg.IdleTimeout.Duration)
 }

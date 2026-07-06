@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,8 @@ import (
 	"github.com/terion-name/airpc/internal/httpheaders"
 	"github.com/terion-name/airpc/internal/natscore"
 	"github.com/terion-name/airpc/internal/protocol/httpunary"
+	"github.com/terion-name/airpc/internal/protocol/tunnel"
+	"github.com/terion-name/airpc/internal/telemetry"
 )
 
 const (
@@ -25,13 +29,15 @@ const (
 )
 
 type Server struct {
-	httpServer *http.Server
-	dataServer *http.Server
-	listener   net.Listener
-	dataListen net.Listener
-	tcpListen  []net.Listener
-	nats       *natscore.Client
-	done       chan error
+	httpServer  *http.Server
+	dataServer  *http.Server
+	listener    net.Listener
+	dataListen  net.Listener
+	tcpListen   []net.Listener
+	registry    *tunnelRegistry
+	nats        *natscore.Client
+	metricsAddr string
+	done        chan error
 }
 
 type route struct {
@@ -41,8 +47,13 @@ type route struct {
 }
 
 func Start(ctx context.Context, cfg config.Config) (*Server, error) {
-	nc, err := natscore.Connect(cfg.NATS.EdgeURLOrDefault(), "airpc-edge")
+	nc, err := natscore.Connect(cfg.NATS.EdgeURLOrDefault(), "airpc-edge", cfg.NATS.CredsFile)
 	if err != nil {
+		return nil, err
+	}
+	metricsAddr, err := telemetry.StartServer(ctx, cfg.Edge.MetricsAddr)
+	if err != nil {
+		nc.Close()
 		return nil, err
 	}
 
@@ -57,16 +68,36 @@ func Start(ctx context.Context, cfg config.Config) (*Server, error) {
 		nc.Close()
 		return nil, fmt.Errorf("listen edge data %s: %w", cfg.Edge.DataAddr, err)
 	}
+	var publicTLS *tls.Config
+	if cfg.Edge.TLS != nil {
+		publicTLS, err = cfg.Edge.TLS.ServerTLS()
+		if err == nil {
+			var dataTLS *tls.Config
+			dataTLS, err = cfg.Edge.TLS.DataTLS()
+			if err == nil {
+				listener = tls.NewListener(listener, publicTLS)
+				dataListener = tls.NewListener(dataListener, dataTLS)
+			}
+		}
+		if err != nil {
+			_ = listener.Close()
+			_ = dataListener.Close()
+			nc.Close()
+			return nil, err
+		}
+	}
 
 	registry := newTunnelRegistry()
 	h := handler{nats: nc, httpRoutes: httpRoutes(cfg.Routes), wsRoutes: wsRoutes(cfg.Routes), registry: registry}
 	server := &Server{
-		httpServer: &http.Server{Handler: h},
-		dataServer: &http.Server{Handler: dataHandler{registry: registry, token: cfg.Connector.TunnelToken}},
-		listener:   listener,
-		dataListen: dataListener,
-		nats:       nc,
-		done:       make(chan error, 1),
+		httpServer:  &http.Server{Handler: h},
+		dataServer:  &http.Server{Handler: dataHandler{registry: registry, token: cfg.Connector.TunnelToken}},
+		listener:    listener,
+		dataListen:  dataListener,
+		registry:    registry,
+		nats:        nc,
+		metricsAddr: metricsAddr,
+		done:        make(chan error, 1),
 	}
 
 	for _, r := range tcpRoutes(cfg.Routes) {
@@ -77,6 +108,9 @@ func Start(ctx context.Context, cfg config.Config) (*Server, error) {
 			closeListeners(server.tcpListen)
 			nc.Close()
 			return nil, fmt.Errorf("listen route %s on %s: %w", r.Name, r.Listen, err)
+		}
+		if r.TLS {
+			tcpListener = tls.NewListener(tcpListener, publicTLS)
 		}
 		server.tcpListen = append(server.tcpListen, tcpListener)
 	}
@@ -93,29 +127,19 @@ func Start(ctx context.Context, cfg config.Config) (*Server, error) {
 	}
 
 	go func() {
+		var runErr error
 		select {
 		case <-ctx.Done():
-		case err := <-errCh:
-			if err != nil {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				closeHTTPServer(shutdownCtx, server.httpServer)
-				closeHTTPServer(shutdownCtx, server.dataServer)
-				cancel()
-				closeListeners(server.tcpListen)
-				_ = nc.Drain()
-				server.done <- err
-				close(server.done)
-				return
-			}
+		case runErr = <-errCh:
 		}
-
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		closeHTTPServer(shutdownCtx, server.httpServer)
 		closeHTTPServer(shutdownCtx, server.dataServer)
 		cancel()
 		closeListeners(server.tcpListen)
+		registry.closeAll()
 		_ = nc.Drain()
-		server.done <- nil
+		server.done <- runErr
 		close(server.done)
 	}()
 	return server, nil
@@ -154,6 +178,13 @@ func (s *Server) DataAddr() string {
 	return s.dataListen.Addr().String()
 }
 
+func (s *Server) MetricsAddr() string {
+	if s == nil {
+		return ""
+	}
+	return s.metricsAddr
+}
+
 func (s *Server) TCPAddrs() []string {
 	if s == nil {
 		return nil
@@ -179,6 +210,9 @@ func (s *Server) Close(ctx context.Context) error {
 	closeListeners(s.tcpListen)
 	closeHTTPServer(ctx, s.dataServer)
 	closeHTTPServer(ctx, s.httpServer)
+	if s.registry != nil {
+		s.registry.closeAll()
+	}
 	return nil
 }
 
@@ -206,6 +240,35 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.NotFound(w, req)
 		return
 	}
+	h.serveUnary(w, req, matched, suffix)
+}
+
+// statusRecorder captures the response status for metrics while passing
+// Flush through for streamed bodies.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (h handler) serveUnary(rw http.ResponseWriter, req *http.Request, matched route, suffix string) {
+	start := time.Now()
+	recorder := &statusRecorder{ResponseWriter: rw, status: http.StatusOK}
+	var w http.ResponseWriter = recorder
+	defer func() {
+		telemetry.HTTPRequests.WithLabelValues(matched.cfg.Name, strconv.Itoa(recorder.status)).Inc()
+		telemetry.HTTPDuration.WithLabelValues(matched.cfg.Name).Observe(time.Since(start).Seconds())
+	}()
 
 	body, ok := readBounded(w, req.Body, routeRequestLimit(matched.cfg))
 	if !ok {
@@ -242,6 +305,11 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	reply, err := h.nats.Request(ctx, matched.cfg.UnarySubject(), payload)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Client gone or deadline hit: the reply is unusable either way,
+			// so tell connectors to abort the backend call.
+			_ = h.nats.Publish(config.CancelSubject(requestID), nil)
+		}
 		status := http.StatusBadGateway
 		if errors.Is(err, natscore.ErrNoResponders) {
 			status = http.StatusServiceUnavailable
@@ -257,7 +325,63 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "connector error", http.StatusBadGateway)
 		return
 	}
+	if resp.StreamSessionID != "" {
+		h.serveStreamedResponse(w, req, resp)
+		return
+	}
 	writeResponse(w, resp)
+}
+
+// serveStreamedResponse relays a response body the connector streams over its
+// data tunnel instead of inlining in the NATS reply. The stream is not bound
+// by the route timeout; it ends with the body, a client disconnect, or a
+// tunnel failure.
+func (h handler) serveStreamedResponse(w http.ResponseWriter, req *http.Request, resp httpunary.Response) {
+	link := h.registry.get(resp.ConnectorID)
+	if link == nil {
+		http.Error(w, "connector stream unavailable", http.StatusBadGateway)
+		return
+	}
+	session := claimStreamSession(link, resp.StreamSessionID)
+	if session == nil {
+		http.Error(w, "connector stream unavailable", http.StatusBadGateway)
+		return
+	}
+	defer session.Close()
+
+	for name, values := range httpheaders.FilterResponse(resp.Headers) {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(resp.Status)
+	flusher, _ := w.(http.Flusher)
+
+	for {
+		select {
+		case <-req.Context().Done():
+			return
+		case <-session.Done():
+			// Tunnel died mid-body: abort the connection so the client sees
+			// a truncated response, not a clean end.
+			panic(http.ErrAbortHandler)
+		case frame := <-session.Recv():
+			switch frame.Type {
+			case tunnel.FrameData:
+				if _, err := w.Write(frame.Payload); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+				session.AckData()
+			case tunnel.FrameEOF:
+				return
+			case tunnel.FrameClose, tunnel.FrameError:
+				panic(http.ErrAbortHandler)
+			}
+		}
+	}
 }
 
 func httpRoutes(routes []config.Route) []route {
