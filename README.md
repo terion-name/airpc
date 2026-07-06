@@ -1,135 +1,116 @@
-# airpc
+# airpc: Zero-Inbound RPC & Socket Gateway
 
-airpc is an outbound-only edge/connector gateway: expose private RPC services without opening a single inbound port on the private network. It supports:
+**airpc** exposes RPC services and raw sockets that live in a strictly private network — behind a firewall, NAT, or VPN — to public clients or other network zones **without opening a single inbound port** to the private side. Clients keep using their existing HTTP, gRPC, WebSocket, or TCP clients; they only change the endpoint they dial.
 
-- **HTTP** proxying over NATS Core request/reply, with SSE/chunked/large responses streamed over the data tunnel and client-disconnect cancellation propagated to the backend;
-- **TCP** and **gRPC** opaque byte streams over a connector-initiated WebSocket data tunnel;
-- **WebSocket** message relay (including close-code propagation) over the same tunnel;
-- **TLS** termination on public listeners plus optional mTLS between connector and edge; and
-- **Prometheus metrics**, including per-method gRPC observability decoded passively from the opaque relay.
+It is the sibling of [**air3**](https://github.com/terion-name/air3), which applies the same zero-inbound edge/connector concept to files and objects (S3). The two compose naturally: **airpc carries the calls, air3 carries the bytes** — use airpc for APIs, RPC, and sockets, and air3 when large objects need to cross the same boundary. A copy of air3 is vendored under [`references/air3`](references/air3) as a design reference.
 
-An **edge** process listens on public HTTP/TCP addresses. A private **connector** process dials NATS, queue-subscribes for configured routes, and opens the outbound data WebSocket to the edge. HTTP requests use MessagePack envelopes on `airpc.v1.route.<route>.unary`; cancels are published on `airpc.v1.cancel.<request_id>`. Non-unary routes first use `airpc.v1.route.<route>.open` to select a connector, then relay frames on that connector's active tunnel.
+## Why
 
-SDK adapters, transparent proxying, and protocol-aware gRPC parsing are deliberately post-MVP (see `Known limitations`).
+Imagine a gRPC or JSON-RPC service deep inside your private infrastructure that a public app — or a service in another, less-trusted zone — needs to call.
 
-## Run locally
+Normally you would have to open an inbound port, set up a VPN, or place a reverse proxy in a DMZ with network reachability into the private zone. Every one of those creates an inbound path into the network you were trying to keep closed.
 
-Start NATS, then run one edge and one connector with the same config:
+**airpc splits the responsibility instead:**
+
+1. An **Edge Gateway** sits in the public zone or DMZ. It terminates client connections (HTTP/1.1, WebSocket, TLS, raw TCP, gRPC-over-HTTP/2) but has **no credentials for and no route into** the private network.
+2. A **Private Connector** sits next to your service. It holds the private reachability but has **no inbound listeners** — it only dials out: to NATS, and to the edge's data port.
+3. A **NATS broker** is the control plane between them: routing, connector selection, cancellation. Bulk data never flows through NATS.
+
+```
+Client / existing SDK
+        │ HTTP/1.1 · gRPC · WebSocket · raw TCP
+        ▼
+  airpc-edge ───────── NATS control plane ─────────▶ airpc-connector
+  public / DMZ                                        private network
+        ▲                                                   │
+        └────── connector-initiated data tunnel ◀───────────┘
+                                                            ▼
+                                              your existing RPC server
+```
+
+Because the connector initiates every connection, the private zone's firewall can stay **outbound-only**. Scaling is horizontal: connectors for the same route join a NATS queue group, and each request or session is handled by exactly one of them.
+
+## What it carries
+
+| Route mode  | Public side                                  | Private target        | Works for                                                        |
+| ----------- | -------------------------------------------- | --------------------- | ---------------------------------------------------------------- |
+| `http`      | Path prefix / exact path on the edge         | `http://` / `https://`| REST, JSON-RPC, tRPC, Connect unary, SSE, large downloads         |
+| `grpc`      | Dedicated TCP listener (opaque HTTP/2)       | `host:port`           | gRPC — unary, server/client/bidi streaming, all metadata intact   |
+| `websocket` | Path prefix / exact path on the edge         | `ws://` / `wss://`    | tRPC subscriptions, RSocket-over-WS, custom realtime protocols    |
+| `tcp`       | Dedicated TCP listener                       | `host:port`           | Thrift TSocket, RSocket TCP, databases, any binary protocol       |
+
+Key behaviors (details in [docs/architecture.md](docs/architecture.md)):
+
+- **HTTP responses stream.** SSE, chunked, and oversized responses are streamed through the data tunnel with backpressure; small responses ride the NATS reply. Client disconnects cancel the backend request.
+- **The data tunnel is lossless and fair.** Per-session credit-based flow control means one slow consumer never stalls other sessions; TCP half-close and WebSocket close codes propagate faithfully.
+- **It heals itself.** Connectors redial the tunnel with backoff after an edge restart; the edge retries session opens across the connector pool; NATS reconnects are unlimited.
+- **TLS where you want it.** The edge can terminate TLS on any listener; the tunnel supports mTLS with a private CA; or leave a TCP route as passthrough for end-to-end TLS.
+- **Observable.** Prometheus metrics on both processes — including per-method gRPC method/status/latency decoded *passively* from the relayed stream, without ever re-terminating gRPC.
+
+## Quick start
+
+Requirements: Go 1.22+, a NATS server.
 
 ```sh
+# 1. Start NATS (control plane)
 nats-server -js=false
 
-go run ./cmd/airpc edge start --config examples/airpc.yaml
+# 2. Start something private to expose (demo: a local HTTP server)
+python3 -m http.server 9000
 
+# 3. Start the edge and a connector with the same config
+go run ./cmd/airpc edge start --config examples/airpc.yaml
 go run ./cmd/airpc connector start --config examples/airpc.yaml --id local-1
 ```
 
-With the example config, requests to the edge under `/demo` are sent to the connector and forwarded to `http://127.0.0.1:9000` with the public prefix stripped:
+The example config maps the public prefix `/demo` to the private `http://127.0.0.1:9000`:
 
 ```sh
-curl -i http://127.0.0.1:8080/demo/hello?name=airpc
+curl -i http://127.0.0.1:8080/demo/
 ```
 
-The same edge process also starts:
+That's the whole model. Guides for each protocol and deployment topic:
 
-- `edge.data_addr` for connector-owned WebSocket tunnels at `/_airpc/data`;
-- each `tcp` route's `listen` address and relays raw bytes to the connector target; and
-- each `grpc` route's `listen` address as an opaque HTTP/2/TCP stream.
+## Documentation
 
-WebSocket routes are served on the edge HTTP listener using `public_path` or `public_prefix` and are relayed as WebSocket messages to private `ws://` or `wss://` targets.
+- [Architecture](docs/architecture.md) — components, control plane vs. data plane, tunnel protocol, security model, failure behavior
+- [Configuration reference](docs/configuration.md) — every field, defaults, and a fully annotated example
+- Guides:
+  - [Expose an HTTP API](docs/guides/expose-http.md) — routing, headers, body limits, streaming/SSE, cancellation
+  - [Expose a gRPC service](docs/guides/expose-grpc.md) — opaque relay, TLS options, per-method metrics
+  - [Expose a WebSocket service](docs/guides/expose-websocket.md)
+  - [Expose raw TCP](docs/guides/expose-tcp.md) — Thrift, RSocket, databases, anything
+  - [TLS & mTLS](docs/guides/tls.md) — terminate, passthrough, and lock the tunnel to a private CA
+  - [Kubernetes](docs/guides/kubernetes.md) — manifests, scaling connectors, cross-cluster layout
+  - [Observability](docs/guides/observability.md) — metrics reference and dashboards to build
 
-`grpc` mode intentionally preserves the raw HTTP/2/TCP stream — trailers, `*-bin` metadata, deadlines, cancellation, and bidirectional streaming all pass through untouched, because re-terminating gRPC is where proxies break in subtle ways. Protocol awareness is observation-only: see "Observability" below.
+## Deployment shapes
 
-### HTTP unary, streaming responses, and cancellation
+- **Local / bare metal:** one static binary (`go build ./cmd/airpc`), run `edge start` and `connector start` with a shared YAML file.
+- **Docker Compose:** [`deploy/compose.yaml`](deploy/compose.yaml) runs the full topology — NATS, edge, connector, and HTTP/TCP/WebSocket/gRPC backends on segregated `public` / `broker` / `private` networks. `make e2e` builds it and runs the smoke suite, including connector-down and recovery scenarios.
+- **Kubernetes:** [`deploy/k8s/`](deploy/k8s/) has ready-to-edit manifests; see the [Kubernetes guide](docs/guides/kubernetes.md).
 
-HTTP request bodies are read fully (bounded by `max_inline_request`) and carried in the NATS request. Responses are inlined in the NATS reply when they fit; when a response is chunked, an `text/event-stream`, or its declared length exceeds `max_inline_response`, the connector instead streams the body through an `http-stream` session on its data tunnel and the edge flushes chunks to the client as they arrive. Streamed bodies are not bound by the route `timeout` (which still bounds request dispatch and response headers). If the connector's tunnel is down, responses that fit inline still work; oversized ones fail.
+## Relationship to air3
 
-When the public client disconnects or the route timeout expires before a reply, the edge publishes `airpc.v1.cancel.<request_id>` and the connector aborts the in-flight backend request.
+[air3](https://github.com/terion-name/air3) is the same security architecture applied to object storage: a public edge that validates signed URLs, a private connector that holds the S3 credentials, NATS carrying only small tickets, and the object bytes moving over a connector-initiated data plane. airpc generalizes that pattern from files to **calls and sockets**.
 
-### Data tunnel semantics
-
-One WebSocket tunnel per connector multiplexes all stream sessions as MessagePack frames keyed by `session_id`.
-
-- **Lossless, per-session flow control.** Each side may have at most 32 unacknowledged data frames (~1 MiB at the 32 KiB relay read size) in flight per session; the receiver returns credit with `window` frames as it consumes data. A slow client or backend backpressures only its own session — other sessions on the same tunnel keep flowing.
-- **TCP half-close propagation.** A client (or backend) write-side `FIN` is relayed as an `eof` frame and half-closes the other end, so request/half-close/response protocols work; the session ends when both directions have finished.
-- **Automatic tunnel reconnect.** The connector redials the edge data WebSocket with exponential backoff (250ms doubling to 5s) for the life of the process. While disconnected, the connector rejects route opens over NATS; the edge retries rejected opens every 50ms until the route timeout, so another connector in the queue group can take the session. Established sessions on a dropped tunnel are closed, not resumed. Edge shutdown closes tunnels explicitly so connectors notice immediately.
-- **Idle timeout.** Routes may set `idle_timeout`; a stream session with no relayed data in either direction for that long is closed (default: no idle timeout). WebSocket ping/pong keepalives are answered by each hop but are not relayed and do not count as activity.
-- **WebSocket close codes.** A close initiated by either end is relayed with its original status code and text, so clients and backends complete their close handshakes normally.
-
-## Configuration
-
-See [`examples/airpc.yaml`](examples/airpc.yaml). Important fields are:
-
-- `nats.url`: default NATS server URL used by both edge and connector.
-- `nats.edge_url` / `nats.connector_url` (optional): role-specific NATS URLs, useful for separate NATS users and permissions in Compose or production.
-- `nats.creds_file` (optional): path to a NATS `.creds` file used for authentication. NATS connections reconnect indefinitely after the initial connect succeeds.
-- `edge.http_addr`: HTTP listen address for HTTP unary and public WebSocket routes.
-- `edge.data_addr`: WebSocket tunnel listen address for connector data sessions.
-- `edge.metrics_addr` / `connector.metrics_addr` (optional): serve Prometheus metrics at `/metrics`. The endpoint is unauthenticated — bind it to a private interface.
-- `edge.tls` (optional): `cert_file`/`key_file` terminate TLS on the HTTP and data listeners; `client_ca_file` additionally requires a verified connector client certificate on the **data listener only** (mTLS). TLS 1.2 minimum.
-- `connector.edge_data_url`: connector URL for `edge.data_addr`, normally `ws://<edge-data>/_airpc/data` (`wss://` when `edge.tls` is set).
-- `connector.tunnel_token` (optional): shared token required on the data tunnel.
-- `connector.tls` (optional, requires a `wss://` data URL): `ca_file` trusts a private CA for the edge certificate; `cert_file`/`key_file` present a client certificate for mTLS; `server_name` overrides SNI.
-- `routes[].name`: route token used in NATS subjects.
-- `routes[].mode: http`: HTTP unary route. Uses `public_prefix`/`public_path`, URL `target`, inline body limits, `timeout`, and `forwarded_headers`.
-- `routes[].mode: websocket`: public WebSocket route. Uses `public_prefix`/`public_path` and private `ws://`/`wss://` `target`.
-- `routes[].mode: tcp`: public TCP listener. Uses `listen` and private `host:port` `target`.
-- `routes[].mode: grpc`: public TCP listener for opaque gRPC-over-HTTP/2. Uses `listen` and private `host:port` `target`.
-- `routes[].idle_timeout` (optional, stream modes): close a session after this long with no relayed data in either direction. Unset or `0` disables the idle check. Do not set it below the application's own keepalive interval — WebSocket ping/pong does not count as activity.
-- `routes[].tls` (optional, tcp/grpc only): serve this route's public listener with the `edge.tls` certificate. Leave unset for TLS-passthrough of protocols that bring their own TLS.
-
-Derived NATS names:
-
-- Unary subject: `airpc.v1.route.<route>.unary`
-- Open subject for stream routes: `airpc.v1.route.<route>.open`
-- Queue group: `airpc.route.<route>.connectors`
-- Cancel subject: `airpc.v1.cancel.<request_id>`
-
-The edge strips hop-by-hop HTTP headers and only forwards HTTP request headers listed in `forwarded_headers`. Response hop-by-hop headers are stripped before writing back to the client. The runtime does not log request/response bodies or Authorization values.
-
-## Observability
-
-With `metrics_addr` set, edge and connector expose Prometheus metrics:
-
-- `airpc_http_requests_total{route,status}` and `airpc_http_request_duration_seconds{route}` — HTTP unary at the edge.
-- `airpc_stream_sessions_total` / `airpc_stream_sessions_active{route,mode}` and `airpc_stream_bytes_total{route,direction}` — tcp/grpc/websocket sessions.
-- `airpc_tunnel_connected{connector_id}` and `airpc_tunnel_dials_total{connector_id,outcome}` — connector data-tunnel health.
-- `airpc_grpc_rpcs_total{route,method,code}` and `airpc_grpc_rpc_duration_seconds{route,method}` — per-method gRPC RPCs on `grpc` routes.
-
-The gRPC metrics come from a **passive** HTTP/2 decoder on the relayed bytes: it extracts `:path` and `grpc-status` from frame headers without ever modifying, delaying, or re-terminating the stream. It is deliberately best-effort — if observation cannot keep up or the stream is not parseable plaintext HTTP/2 (e.g. TLS-passthrough where the client encrypts end-to-end), observation goes dark for that connection and traffic is unaffected. Bodies, header values, and message payloads are never recorded.
-
-## Docker Compose bench
-
-The Compose bench in [`deploy/compose.yaml`](deploy/compose.yaml) runs NATS, edge, connector, private HTTP/TCP/WebSocket/gRPC backends, and a public-only test runner on separated `public`, `broker`, and internal `private` networks. Run:
-
-```sh
-make e2e
-```
-
-The smoke flow checks normal traffic, public/edge inability to reach private backend addresses directly, connector-down failures, and recovery after restarting the connector.
-
-## Kubernetes
-
-[`deploy/k8s/`](deploy/k8s/) contains plain manifests: a ConfigMap holding `airpc.yaml`, an edge Deployment + Service (readiness on `/_airpc/healthz`), and a connector Deployment whose replicas join the route queue groups using their pod names as connector IDs. Edit the ConfigMap's routes and targets, point `connector.edge_data_url` at the edge Service (or its public address when connectors run in another cluster), and:
-
-```sh
-kubectl apply -f deploy/k8s/
-```
-
-For production, move `tunnel_token` (or the mTLS key material) into a Secret and expose the edge via LoadBalancer or an Ingress in front of the `http` port.
-
-## Known limitations
-
-These are deliberate post-MVP cuts, in line with the original design's build order:
-
-- **HTTP request bodies are inline-only.** Request bodies are bounded by `max_inline_request`; client-streaming and bidirectional HTTP (e.g. gRPC over the `http` mode) are not supported — use the opaque `grpc`/`tcp` modes for those. Response trailers are not relayed.
-- **No gRPC re-termination.** gRPC is relayed opaquely by design; airpc observes methods/statuses for metrics but does not route per-method or rewrite gRPC semantics. Put a gRPC-aware L7 proxy (e.g. Envoy) in front of or behind airpc if per-method routing is required.
-- **No SDK adapters, forward/transparent proxy modes, or Kubernetes operator.** Endpoint replacement (URL/host:port/DNS) is the supported integration path; the manifests in `deploy/k8s/` are static.
+They are designed to be deployed side by side: point your service traffic at airpc and your file traffic at air3, and the private zone still has zero inbound ports. For request/response payloads too large to inline, the intended pattern is to keep the RPC on airpc and move the payload as an object reference through air3.
 
 ## Development
 
 ```sh
-go test ./...
+go test ./...          # unit + integration (in-process NATS, edge, connector)
+go test -race ./...
+make e2e               # Docker Compose end-to-end smoke
 ```
 
-`internal/integration` starts an in-process NATS server, edge, and connector, and covers the full surface end-to-end: HTTP unary, response streaming (SSE incrementality, oversized bodies, inline fallback), client-disconnect cancellation, lossless bulk transfer under backpressure, TCP half-close, per-session isolation of a stalled session, idle teardown, tunnel recovery after an edge restart, open retry past a tunnel-down connector, WebSocket close-code propagation, TLS/mTLS (HTTPS unary, TLS TCP route, wss tunnel with client certificates, rejection without one), and Prometheus metrics including gRPC method/status observation of a real grpc-go call through the relay.
+The integration suite covers the full surface end-to-end: HTTP unary and streaming (SSE incrementality, oversized bodies, inline fallback), cancellation, lossless bulk transfer under backpressure, TCP half-close, session isolation under a stalled peer, idle teardown, tunnel reconnect after an edge restart, open retry past a tunnel-down connector, WebSocket close codes, TLS/mTLS, and Prometheus metrics including passive gRPC observation of a real grpc-go call.
+
+## Known limitations
+
+Deliberate scope cuts, aligned with the original design's build order:
+
+- **HTTP request bodies are inline-only** (bounded by `max_inline_request`); client-streaming/bidi HTTP is not supported — use the `grpc`/`tcp` modes, which carry it opaquely. HTTP response trailers are not relayed.
+- **No gRPC re-termination.** gRPC is relayed byte-faithfully; airpc observes methods and statuses for metrics but does not route per-method or rewrite gRPC semantics. Put an L7 proxy (e.g. Envoy) in front of a route if you need that.
+- **WebSocket request headers/subprotocols are not forwarded** to the private backend; the relay carries messages and close codes.
+- **No SDK adapters, forward/transparent proxy modes, or Kubernetes operator.** Endpoint replacement (URL / host:port / DNS) is the supported integration path.
