@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airpc-edge
+  labels:
+    app.kubernetes.io/name: airpc-edge
+    app.kubernetes.io/part-of: airpc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: airpc-edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: airpc-edge
+        app.kubernetes.io/part-of: airpc
+    spec:
+      containers:
+        - name: edge
+          image: ghcr.io/terion-name/airpc:latest
+          command: ["/usr/local/bin/airpc"]
+          args: ["edge", "start", "--config", "/etc/airpc/airpc.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: data
+              containerPort: 8081
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /_airpc/healthz
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/airpc
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: airpc-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airpc-edge
+  labels:
+    app.kubernetes.io/name: airpc-edge
+    app.kubernetes.io/part-of: airpc
+spec:
+  # Use LoadBalancer (or an Ingress in front of the http port) to expose the
+  # edge publicly. Connectors dial the data port from wherever they run.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: airpc-edge
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: data
+      port: 8081
+      targetPort: data

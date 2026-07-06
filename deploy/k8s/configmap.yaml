@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airpc-config
+  labels:
+    app.kubernetes.io/part-of: airpc
+data:
+  airpc.yaml: |
+    nats:
+      url: nats://nats:4222
+    edge:
+      http_addr: :8080
+      data_addr: :8081
+      metrics_addr: :9090
+      # tls:
+      #   cert_file: /etc/airpc-tls/tls.crt
+      #   key_file: /etc/airpc-tls/tls.key
+      #   client_ca_file: /etc/airpc-tls/ca.crt
+    connector:
+      edge_data_url: ws://airpc-edge:8081/_airpc/data
+      metrics_addr: :9090
+      # Use a Secret and an env-templated config for real deployments.
+      tunnel_token: replace-me
+    routes:
+      - name: demo
+        mode: http
+        public_prefix: /demo
+        target: http://demo-backend.default.svc.cluster.local:8080
+        max_inline_request: 4MiB
+        max_inline_response: 4MiB
+        timeout: 30s
+        forwarded_headers: [authorization, accept, content-type, x-request-id]
